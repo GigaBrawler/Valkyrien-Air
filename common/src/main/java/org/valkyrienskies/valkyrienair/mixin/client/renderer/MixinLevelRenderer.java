@@ -12,6 +12,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.ShipWaterPocketExternalWaterCullRenderContext;
+import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.ShipWaterPocketEmbeddiumRenderTypes;
 
 // Some renderers can overwrite LevelRenderer's chunk-layer rendering, which makes INVOKE-based injections into that
 // method fragile. We track the active world translucent pass here and drive shader uniform updates from ShaderInstance#apply.
@@ -30,7 +31,7 @@ public abstract class MixinLevelRenderer {
         final PoseStack poseStack, final double camX, final double camY, final double camZ, final Matrix4f projectionMatrix,
         final CallbackInfo ci) {
         if (this.level == null) return;
-        if (renderType != RenderType.translucent()) return;
+        if (!ShipWaterPocketEmbeddiumRenderTypes.isWorldTranslucentPass(renderType)) return;
         ShipWaterPocketExternalWaterCullRenderContext.beginWorldTranslucentChunkLayer(this.level, camX, camY, camZ);
     }
 
@@ -42,7 +43,7 @@ public abstract class MixinLevelRenderer {
     private void valkyrienair$endWorldTranslucentChunkLayer(final RenderType renderType,
         final PoseStack poseStack, final double camX, final double camY, final double camZ, final Matrix4f projectionMatrix,
         final CallbackInfo ci) {
-        if (renderType != RenderType.translucent()) return;
+        if (!ShipWaterPocketEmbeddiumRenderTypes.isWorldTranslucentPass(renderType)) return;
         ShipWaterPocketExternalWaterCullRenderContext.endWorldTranslucentChunkLayer();
     }
 }

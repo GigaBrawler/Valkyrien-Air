@@ -6,7 +6,14 @@
   "client": [
     "client.MixinCamera",
     "client.MixinMinecraft",
+    "client.embeddium.MixinEmbeddiumDefaultMaterials",
+    "client.embeddium.MixinEmbeddiumShaderChunkRenderer",
+    "client.embeddium.MixinEmbeddiumShaderLoader",
+    "client.embeddium.TerrainRenderPassAccessor",
+    "client.renderer.MixinItemBlockRenderTypes",
     "client.renderer.MixinLevelRenderer",
+    "client.renderer.MixinRenderType",
+    "client.renderer.RenderTypeAccessor",
     "client.renderer.MixinShaderInstance",
     "feature.ship_water_pockets.MixinClientPacketListener"
   ],
