@@ -208,6 +208,7 @@ object ShipWaterPocketManager {
         val sizeY: Int,
         val sizeZ: Int,
         val open: BitSet,
+        val interior: BitSet,
         val waterReachable: BitSet,
     )
 
@@ -224,6 +225,7 @@ object ShipWaterPocketManager {
             state.sizeY,
             state.sizeZ,
             state.open,
+            state.interior,
             state.waterReachable,
         )
     }
@@ -752,6 +754,87 @@ object ShipWaterPocketManager {
         return out
     }
 
+    /**
+     * Computes a water-reachability mask for rendering, using the provided [shipTransform].
+     *
+     * This is used by the water-surface culling shader to stay stable when ships move/rotate quickly between ticks.
+     * It intentionally operates on the already-computed [open] voxel set and does not mutate any [ShipPocketState].
+     */
+    @JvmStatic
+    fun computeWaterReachableForRender(
+        level: Level,
+        minX: Int,
+        minY: Int,
+        minZ: Int,
+        sizeX: Int,
+        sizeY: Int,
+        sizeZ: Int,
+        open: BitSet,
+        shipTransform: ShipTransform,
+        out: BitSet,
+    ): BitSet {
+        out.clear()
+
+        val volume = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
+        if (volume <= 0 || volume > MAX_SIM_VOLUME.toLong()) return out
+        if (open.isEmpty) return out
+
+        val volumeInt = volume.toInt()
+
+        var queue = tmpFloodQueue.get()
+        if (queue.size < volumeInt) {
+            queue = IntArray(volumeInt)
+            tmpFloodQueue.set(queue)
+        }
+        var head = 0
+        var tail = 0
+
+        val worldPosTmp = Vector3d()
+        val shipPosTmp = Vector3d()
+        val shipBlockPos = BlockPos.MutableBlockPos()
+        val worldBlockPos = BlockPos.MutableBlockPos()
+
+        fun shipCellSubmerged(idx: Int): Boolean {
+            val lx = idx % sizeX
+            val t = idx / sizeX
+            val ly = t % sizeY
+            val lz = t / sizeY
+            shipBlockPos.set(minX + lx, minY + ly, minZ + lz)
+            return isShipCellSubmergedInWorldWater(level, shipTransform, shipBlockPos, shipPosTmp, worldPosTmp, worldBlockPos)
+        }
+
+        fun tryEnqueue(idx: Int) {
+            if (!open.get(idx) || out.get(idx)) return
+            if (!shipCellSubmerged(idx)) return
+            out.set(idx)
+            queue[tail++] = idx
+        }
+
+        // Seed from boundary open cells that are submerged in world water; then flood-fill through submerged open cells.
+        forEachBoundaryIndex(sizeX, sizeY, sizeZ) { idx -> tryEnqueue(idx) }
+
+        val strideY = sizeX
+        val strideZ = sizeX * sizeY
+
+        while (head < tail) {
+            val idx = queue[head++]
+
+            val lx = idx % sizeX
+            val t = idx / sizeX
+            val ly = t % sizeY
+            val lz = t / sizeY
+
+            if (lx > 0) tryEnqueue(idx - 1)
+            if (lx + 1 < sizeX) tryEnqueue(idx + 1)
+            if (ly > 0) tryEnqueue(idx - strideY)
+            if (ly + 1 < sizeY) tryEnqueue(idx + strideY)
+            if (lz > 0) tryEnqueue(idx - strideZ)
+            if (lz + 1 < sizeZ) tryEnqueue(idx + strideZ)
+        }
+
+        return out
+    }
+
     private fun updateFlooding(level: ServerLevel, ship: LoadedShip, state: ShipPocketState, shipTransform: ShipTransform) {
         val open = state.open
         val interior = state.interior
@@ -772,11 +855,9 @@ object ShipWaterPocketManager {
         // Compute newly flooded cells from outside water contact (waterline-aware).
         val externalWet = state.waterReachable
 
-        // Compute newly flooded cells from existing water inside the ship.
-        val internalWet = floodFillFromSeedsSubmerged(level, shipTransform, state, materialized)
-
+        // Only treat outside water contact as "flooding" for instant materialization.
+        // Player-placed water inside a closed pocket should behave like vanilla flow, not instantly fill the chamber.
         flooded.or(externalWet)
-        flooded.or(internalWet)
 
         // Materialize water blocks for flooded interior cells.
         val toAdd = flooded.clone() as BitSet

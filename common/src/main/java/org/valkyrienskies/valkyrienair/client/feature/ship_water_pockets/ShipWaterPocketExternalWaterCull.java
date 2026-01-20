@@ -9,6 +9,7 @@ import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
+import java.util.BitSet;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -91,6 +92,8 @@ public final class ShipWaterPocketExternalWaterCull {
         private int airTexId;
         private int airTexHeight;
         private long lastAirUploadTick = Long.MIN_VALUE;
+        private long lastAirUploadKey = Long.MIN_VALUE;
+        private final BitSet renderWaterReachable = new BitSet();
 
         private final Matrix4f worldToShip = new Matrix4f();
 
@@ -542,7 +545,14 @@ public final class ShipWaterPocketExternalWaterCull {
                 rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
             }
 
-            updateAirMask(level, masks, snapshot, gameTime);
+            final ShipTransform shipTransform = getShipTransform(ship);
+            final Matrix4dc worldToShip = shipTransform.getWorldToShip();
+            final double biasedM30 = worldToShip.m30() - (double) minX;
+            final double biasedM31 = worldToShip.m31() - (double) minY;
+            final double biasedM32 = worldToShip.m32() - (double) minZ;
+            final long airKey = computeAirKey(geometryRevision, worldToShip, biasedM30, biasedM31, biasedM32);
+
+            updateAirMask(level, masks, snapshot, shipTransform, gameTime, airKey);
 
             // Bind samplers for this slot.
             SHADER.shader.setSampler("ValkyrienAir_AirMask" + slot, masks.airTexId);
@@ -560,11 +570,6 @@ public final class ShipWaterPocketExternalWaterCull {
             // then upload gridMin = 0 so the shader operates in a small local coordinate system.
             SHADER.gridMin[slot].set(0.0f, 0.0f, 0.0f, 0.0f);
             SHADER.gridSize[slot].set((float) sizeX, (float) sizeY, (float) sizeZ, 0.0f);
-
-            final Matrix4dc worldToShip = getShipTransform(ship).getWorldToShip();
-            final double biasedM30 = worldToShip.m30() - (double) minX;
-            final double biasedM31 = worldToShip.m31() - (double) minY;
-            final double biasedM32 = worldToShip.m32() - (double) minZ;
             masks.worldToShip.set(
                 (float) worldToShip.m00(), (float) worldToShip.m01(), (float) worldToShip.m02(), (float) worldToShip.m03(),
                 (float) worldToShip.m10(), (float) worldToShip.m11(), (float) worldToShip.m12(), (float) worldToShip.m13(),
@@ -643,7 +648,14 @@ public final class ShipWaterPocketExternalWaterCull {
                 rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
             }
 
-            updateAirMask(level, masks, snapshot, gameTime);
+            final ShipTransform shipTransform = getShipTransform(ship);
+            final Matrix4dc worldToShip = shipTransform.getWorldToShip();
+            final double biasedM30 = worldToShip.m30() - (double) minX;
+            final double biasedM31 = worldToShip.m31() - (double) minY;
+            final double biasedM32 = worldToShip.m32() - (double) minZ;
+            final long airKey = computeAirKey(geometryRevision, worldToShip, biasedM30, biasedM31, biasedM32);
+
+            updateAirMask(level, masks, snapshot, shipTransform, gameTime, airKey);
 
             bindProgramMaskTextures(handles, slot, masks);
 
@@ -662,10 +674,6 @@ public final class ShipWaterPocketExternalWaterCull {
                 GL20.glUniform4f(handles.gridSizeLoc[slot], (float) sizeX, (float) sizeY, (float) sizeZ, 0.0f);
             }
 
-            final Matrix4dc worldToShip = getShipTransform(ship).getWorldToShip();
-            final double biasedM30 = worldToShip.m30() - (double) minX;
-            final double biasedM31 = worldToShip.m31() - (double) minY;
-            final double biasedM32 = worldToShip.m32() - (double) minZ;
             masks.worldToShip.set(
                 (float) worldToShip.m00(), (float) worldToShip.m01(), (float) worldToShip.m02(), (float) worldToShip.m03(),
                 (float) worldToShip.m10(), (float) worldToShip.m11(), (float) worldToShip.m12(), (float) worldToShip.m13(),
@@ -955,10 +963,53 @@ public final class ShipWaterPocketExternalWaterCull {
         uploadIntTexture(masks.occTexId, MASK_TEX_WIDTH, masks.occTexHeight, masks.occBuffer);
     }
 
+    private static final double AIR_KEY_TRANS_Q = 4.0; // 1/4 block increments
+    private static final double AIR_KEY_ROT_Q = 256.0; // coarse rotation quantization
+
+    private static long computeAirKey(final long geometryRevision, final Matrix4dc worldToShip,
+        final double biasedM30, final double biasedM31, final double biasedM32) {
+        long h = 0xcbf29ce484222325L; // FNV-1a 64-bit offset basis
+        h = fnv1a(h, (int) geometryRevision);
+        h = fnv1a(h, (int) (geometryRevision >>> 32));
+
+        h = fnv1a(h, quantizeRot(worldToShip.m00()));
+        h = fnv1a(h, quantizeRot(worldToShip.m01()));
+        h = fnv1a(h, quantizeRot(worldToShip.m02()));
+        h = fnv1a(h, quantizeRot(worldToShip.m10()));
+        h = fnv1a(h, quantizeRot(worldToShip.m11()));
+        h = fnv1a(h, quantizeRot(worldToShip.m12()));
+        h = fnv1a(h, quantizeRot(worldToShip.m20()));
+        h = fnv1a(h, quantizeRot(worldToShip.m21()));
+        h = fnv1a(h, quantizeRot(worldToShip.m22()));
+
+        h = fnv1a(h, quantizeTrans(biasedM30));
+        h = fnv1a(h, quantizeTrans(biasedM31));
+        h = fnv1a(h, quantizeTrans(biasedM32));
+
+        return h;
+    }
+
+    private static long fnv1a(long h, final int v) {
+        h ^= (v & 0xffffffffL);
+        h *= 0x100000001b3L;
+        return h;
+    }
+
+    private static int quantizeRot(final double v) {
+        return (int) Math.round(v * AIR_KEY_ROT_Q);
+    }
+
+    private static int quantizeTrans(final double v) {
+        return (int) Math.round(v * AIR_KEY_TRANS_Q);
+    }
+
     private static void updateAirMask(final ClientLevel level, final ShipMasks masks,
-        final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot, final long gameTime) {
-        if (masks.lastAirUploadTick == gameTime) return;
+        final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot, final ShipTransform shipTransform,
+        final long gameTime, final long airKey) {
+        final boolean newTick = masks.lastAirUploadTick != gameTime;
+        if (!newTick && masks.lastAirUploadKey == airKey) return;
         masks.lastAirUploadTick = gameTime;
+        masks.lastAirUploadKey = airKey;
 
         final int sizeX = masks.sizeX;
         final int sizeY = masks.sizeY;
@@ -983,11 +1034,28 @@ public final class ShipWaterPocketExternalWaterCull {
             java.util.Arrays.fill(masks.airData, 0);
         }
 
-        final var open = snapshot.getOpen();
-        final var waterReachable = snapshot.getWaterReachable();
+        final BitSet open = snapshot.getOpen();
+        final BitSet waterReachable;
+        if (newTick) {
+            waterReachable = snapshot.getWaterReachable();
+        } else {
+            ShipWaterPocketManager.computeWaterReachableForRender(
+                level,
+                snapshot.getMinX(),
+                snapshot.getMinY(),
+                snapshot.getMinZ(),
+                snapshot.getSizeX(),
+                snapshot.getSizeY(),
+                snapshot.getSizeZ(),
+                open,
+                shipTransform,
+                masks.renderWaterReachable
+            );
+            waterReachable = masks.renderWaterReachable;
+        }
 
         if (open != null && waterReachable != null) {
-            // air = open && !waterReachable
+            // air pocket = open && !waterReachable
             for (int idx = open.nextSetBit(0); idx >= 0; idx = open.nextSetBit(idx + 1)) {
                 if (waterReachable.get(idx)) continue;
                 final int wordIdx = idx >> 5;
