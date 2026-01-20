@@ -6,9 +6,9 @@ import org.jetbrains.annotations.Nullable;
 /**
  * Render-thread state for the external-world water culling shader integration.
  *
- * <p>We avoid direct INVOKE-based injections into chunk-layer render methods because Embeddium/Sodium can overwrite
- * those methods. Instead, we track when the world translucent chunk layer is being rendered and update uniforms when
- * the translucent shader is actually applied (see {@code MixinShaderInstance}).
+ * <p>We avoid direct INVOKE-based injections into chunk-layer render methods because other renderers can overwrite those
+ * methods. Instead, we track when the world translucent chunk layer is being rendered and update uniforms when the
+ * translucent shader is actually applied (see {@code MixinShaderInstance}).
  */
 public final class ShipWaterPocketExternalWaterCullRenderContext {
 

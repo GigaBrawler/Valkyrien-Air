@@ -76,8 +76,6 @@ loom {
 
     forge {
         mixinConfig "valkyrienair-common.mixins.json"
-        mixinConfig "valkyrienair-embeddium.mixins.json"
-        mixinConfig "valkyrienair-iris.mixins.json"
         mixinConfig "valkyrienair.mixins.json"
 
         convertAccessWideners.set(false) // <- CLAVE

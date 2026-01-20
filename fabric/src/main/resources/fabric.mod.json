@@ -23,8 +23,6 @@
   },
   "mixins": [
     "valkyrienair-common.mixins.json",
-    "valkyrienair-embeddium.mixins.json",
-    "valkyrienair-iris.mixins.json",
     "valkyrienair.mixins.json"
   ],
   "depends": {

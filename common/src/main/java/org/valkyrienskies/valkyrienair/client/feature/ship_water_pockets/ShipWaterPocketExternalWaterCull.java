@@ -48,9 +48,6 @@ import org.valkyrienskies.mod.common.VSGameUtilsKt;
 /**
  * Updates uniforms/samplers for the patched {@code rendertype_translucent} shader to cull *world* water surfaces inside
  * ship interiors (air pockets) without affecting ship-rendered water.
- *
- * <p>When the shader patch isn't active (e.g., Sodium/Embeddium or custom shader pipelines), Valkyrien Air falls back to
- * {@link ShipWaterPocketWorldWaterMaskRenderer}.
  */
 public final class ShipWaterPocketExternalWaterCull {
 
