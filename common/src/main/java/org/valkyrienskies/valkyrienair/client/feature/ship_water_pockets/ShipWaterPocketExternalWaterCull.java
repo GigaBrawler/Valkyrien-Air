@@ -28,6 +28,8 @@ import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.joml.Matrix4dc;
 import org.joml.Matrix4f;
 import org.joml.primitives.AABBdc;
@@ -53,6 +55,10 @@ import org.valkyrienskies.mod.common.VSGameUtilsKt;
 public final class ShipWaterPocketExternalWaterCull {
 
     private ShipWaterPocketExternalWaterCull() {}
+
+    private static final Logger LOG = LogManager.getLogger("ValkyrienAir ExternalWaterCull");
+    private static final java.util.Set<Integer> LOGGED_PROGRAM_IDS =
+        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
 
     private static final int MAX_SHIPS = 4;
     private static final int SUB = 8;
@@ -184,6 +190,10 @@ public final class ShipWaterPocketExternalWaterCull {
     private static boolean everEnabled = false;
     private static boolean shaderEverSupported = false;
 
+    private static boolean shouldLogProgramSupport() {
+        return Boolean.getBoolean("valkyrienair.debugEmbeddiumPrograms");
+    }
+
     public static void clear() {
         SHADER.shader = null;
         SHADER.supported = false;
@@ -261,6 +271,9 @@ public final class ShipWaterPocketExternalWaterCull {
         }
 
         final ProgramHandles handles = bindProgramHandles(programId);
+        if (shouldLogProgramSupport() && LOGGED_PROGRAM_IDS.add(programId)) {
+            LOG.info("Embeddium program {} water-cull uniforms supported={}", programId, handles.supported);
+        }
         if (!handles.supported) return;
 
         if (!ValkyrienAirConfig.getEnableShipWaterPockets()) {
@@ -396,6 +409,10 @@ public final class ShipWaterPocketExternalWaterCull {
         handles.waterOverlayUvLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_WaterOverlayUv");
 
         boolean ok = handles.isShipPassLoc >= 0;
+        ok &= handles.cameraWorldPosLoc >= 0;
+        ok &= handles.waterStillUvLoc >= 0;
+        ok &= handles.waterFlowUvLoc >= 0;
+        ok &= handles.waterOverlayUvLoc >= 0;
 
         for (int i = 0; i < MAX_SHIPS; i++) {
             handles.shipAabbMinLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipAabbMin" + i);

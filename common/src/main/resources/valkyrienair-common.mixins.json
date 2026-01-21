@@ -7,6 +7,7 @@
     "client.MixinCamera",
     "client.MixinMinecraft",
     "client.embeddium.MixinEmbeddiumDefaultMaterials",
+    "client.embeddium.MixinEmbeddiumGlProgram",
     "client.embeddium.MixinEmbeddiumShaderChunkRenderer",
     "client.embeddium.MixinEmbeddiumShaderLoader",
     "client.embeddium.TerrainRenderPassAccessor",

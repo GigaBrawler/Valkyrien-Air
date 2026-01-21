@@ -1,6 +1,8 @@
 package org.valkyrienskies.valkyrienair.mixin.client.embeddium;
 
 import net.minecraft.resources.ResourceLocation;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Pseudo;
 import org.spongepowered.asm.mixin.Unique;
@@ -21,6 +23,22 @@ public abstract class MixinEmbeddiumShaderLoader {
     @Unique
     private static final String VA_PATCH_TAG = "valkyrienair_water_cull_patch_v1";
 
+    @Unique
+    private static final Logger VA_LOGGER = LogManager.getLogger("ValkyrienAir EmbeddiumWaterCull");
+
+    @Unique
+    private static final java.util.Set<String> VA_LOGGED_SHADER_IDS =
+        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    @Unique
+    private static final java.util.Set<String> VA_PATCHED_VERTEX_PATHS =
+        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
+
+    @Unique
+    private static boolean valkyrienair$debugLogShaderIds() {
+        return Boolean.getBoolean("valkyrienair.debugEmbeddiumShaderIds");
+    }
+
     @Inject(method = "getShaderSource", at = @At("RETURN"), cancellable = true, require = 0)
     private static void valkyrienair$patchChunkShaders(final ResourceLocation id, final CallbackInfoReturnable<String> cir) {
         if (id == null) return;
@@ -30,12 +48,40 @@ public abstract class MixinEmbeddiumShaderLoader {
         final String path = id.getPath();
         final String src = cir.getReturnValue();
         if (src == null || src.isEmpty()) return;
-        if (src.contains(VA_PATCH_TAG)) return;
 
-        if ("blocks/block_layer_opaque.vsh".equals(path)) {
-            cir.setReturnValue(valkyrienair$patchChunkVertexShader(src));
-        } else if ("blocks/block_layer_opaque.fsh".equals(path)) {
-            cir.setReturnValue(valkyrienair$patchChunkFragmentShader(src));
+        final boolean debugLog = valkyrienair$debugLogShaderIds();
+        final String debugKey = namespace + ":" + path;
+
+        // Sodium/Embeddium may use different base shader names across versions (or via resource packs).
+        // Patch any "block layer" shader that matches our simple injection heuristics.
+        if (path.startsWith("blocks/block_layer_") && path.endsWith(".vsh")) {
+            final boolean alreadyPatched =
+                src.contains(VA_PATCH_TAG) || src.contains("out vec3 " + VA_VAR_CAM_REL_POS + ";");
+            final String out = alreadyPatched ? src : valkyrienair$patchChunkVertexShader(src);
+            final boolean patched = alreadyPatched || out != src;
+            if (patched) {
+                VA_PATCHED_VERTEX_PATHS.add(path);
+            }
+            if (debugLog && VA_LOGGED_SHADER_IDS.add(debugKey)) {
+                VA_LOGGER.info("ShaderLoader.getShaderSource {} (vertex) patched={}", debugKey, patched);
+            }
+            cir.setReturnValue(out);
+        } else if (path.startsWith("blocks/block_layer_") && path.endsWith(".fsh")) {
+            final String vertexPath = path.substring(0, path.length() - 4) + ".vsh";
+            if (!VA_PATCHED_VERTEX_PATHS.contains(vertexPath)) {
+                if (debugLog && VA_LOGGED_SHADER_IDS.add(debugKey)) {
+                    VA_LOGGER.info("ShaderLoader.getShaderSource {} (fragment) skipped: vertex not patched ({})", debugKey, vertexPath);
+                }
+                return;
+            }
+
+            final String out = valkyrienair$patchChunkFragmentShader(src);
+            if (debugLog && VA_LOGGED_SHADER_IDS.add(debugKey)) {
+                VA_LOGGER.info("ShaderLoader.getShaderSource {} (fragment) patched={}", debugKey, out != src);
+            }
+            cir.setReturnValue(out);
+        } else if (debugLog && VA_LOGGED_SHADER_IDS.add(debugKey)) {
+            VA_LOGGER.info("ShaderLoader.getShaderSource {} (unpatched)", debugKey);
         }
     }
 
@@ -53,8 +99,9 @@ public abstract class MixinEmbeddiumShaderLoader {
 
         for (int i = 0; i < lines.length; i++) {
             final String line = lines[i];
+            final String trimmed = line.trim();
 
-            if (!insertedTag && i == 0 && line.startsWith("#version")) {
+            if (!insertedTag && trimmed.startsWith("#version")) {
                 outLines.add(line);
                 outLines.add("");
                 outLines.add("// " + VA_PATCH_TAG);
@@ -64,9 +111,7 @@ public abstract class MixinEmbeddiumShaderLoader {
 
             outLines.add(line);
 
-            final String trimmed = line.trim();
-
-            if (!insertedDecl && "out vec2 v_TexCoord;".equals(trimmed)) {
+            if (!insertedDecl && trimmed.startsWith("out vec2 v_TexCoord")) {
                 outLines.add("");
                 outLines.add("out vec3 " + VA_VAR_CAM_REL_POS + ";");
                 insertedDecl = true;
@@ -74,10 +119,24 @@ public abstract class MixinEmbeddiumShaderLoader {
             }
 
             if (!insertedAssign && trimmed.startsWith("vec3 position") && trimmed.contains("_vert_position") &&
-                trimmed.contains("translation") && trimmed.endsWith(";")) {
+                trimmed.contains("translation") && trimmed.contains("=")) {
                 outLines.add("");
                 outLines.add("    " + VA_VAR_CAM_REL_POS + " = position;");
                 insertedAssign = true;
+            }
+
+            if (!insertedAssign && trimmed.contains("gl_Position") && trimmed.contains("vec4(") && trimmed.contains(", 1.0")) {
+                final int vec4Idx = trimmed.indexOf("vec4(");
+                final int exprStart = vec4Idx >= 0 ? vec4Idx + 5 : -1;
+                final int commaIdx = exprStart >= 0 ? trimmed.indexOf(',', exprStart) : -1;
+                if (commaIdx > exprStart) {
+                    final String expr = trimmed.substring(exprStart, commaIdx).trim();
+                    if (!expr.isEmpty()) {
+                        outLines.add("");
+                        outLines.add("    " + VA_VAR_CAM_REL_POS + " = " + expr + ";");
+                        insertedAssign = true;
+                    }
+                }
             }
         }
 
@@ -101,16 +160,15 @@ public abstract class MixinEmbeddiumShaderLoader {
 
         for (int i = 0; i < lines.length; i++) {
             final String line = lines[i];
+            final String trimmed = line.trim();
 
-            if (!insertedTag && i == 0 && line.startsWith("#version")) {
+            if (!insertedTag && trimmed.startsWith("#version")) {
                 outLines.add(line);
                 outLines.add("");
                 outLines.add("// " + VA_PATCH_TAG);
                 insertedTag = true;
                 continue;
             }
-
-            final String trimmed = line.trim();
 
             if (!insertedUniforms && trimmed.startsWith("void main()")) {
                 // Insert our uniform + helper block before main(), so it's always at global scope.
@@ -160,7 +218,6 @@ public abstract class MixinEmbeddiumShaderLoader {
             "",
             "uniform vec4 ValkyrienAir_ShipAabbMin0;",
             "uniform vec4 ValkyrienAir_ShipAabbMax0;",
-            "uniform vec3 ValkyrienAir_CameraShipPos0;",
             "uniform vec4 ValkyrienAir_GridMin0;",
             "uniform vec4 ValkyrienAir_GridSize0;",
             "uniform mat4 ValkyrienAir_WorldToShip0;",
@@ -169,7 +226,6 @@ public abstract class MixinEmbeddiumShaderLoader {
             "",
             "uniform vec4 ValkyrienAir_ShipAabbMin1;",
             "uniform vec4 ValkyrienAir_ShipAabbMax1;",
-            "uniform vec3 ValkyrienAir_CameraShipPos1;",
             "uniform vec4 ValkyrienAir_GridMin1;",
             "uniform vec4 ValkyrienAir_GridSize1;",
             "uniform mat4 ValkyrienAir_WorldToShip1;",
@@ -178,7 +234,6 @@ public abstract class MixinEmbeddiumShaderLoader {
             "",
             "uniform vec4 ValkyrienAir_ShipAabbMin2;",
             "uniform vec4 ValkyrienAir_ShipAabbMax2;",
-            "uniform vec3 ValkyrienAir_CameraShipPos2;",
             "uniform vec4 ValkyrienAir_GridMin2;",
             "uniform vec4 ValkyrienAir_GridSize2;",
             "uniform mat4 ValkyrienAir_WorldToShip2;",
@@ -187,7 +242,6 @@ public abstract class MixinEmbeddiumShaderLoader {
             "",
             "uniform vec4 ValkyrienAir_ShipAabbMin3;",
             "uniform vec4 ValkyrienAir_ShipAabbMax3;",
-            "uniform vec3 ValkyrienAir_CameraShipPos3;",
             "uniform vec4 ValkyrienAir_GridMin3;",
             "uniform vec4 ValkyrienAir_GridSize3;",
             "uniform mat4 ValkyrienAir_WorldToShip3;",
@@ -339,16 +393,10 @@ public abstract class MixinEmbeddiumShaderLoader {
     private static String valkyrienair$chunkCullDiscardMainBlock() {
         return String.join("\n",
             "    if (ValkyrienAir_CullEnabled > 0.5 && ValkyrienAir_IsShipPass < 0.5 && va_isWaterUv(v_TexCoord)) {",
-            "        vec3 worldPosCamRel = " + VA_VAR_CAM_REL_POS + " + ValkyrienAir_CameraWorldPos;",
-            "        vec3 worldPosAbs = " + VA_VAR_CAM_REL_POS + ";",
-            "        bool camRelIn = va_inAnyShipAabb(worldPosCamRel);",
-            "        bool absIn = va_inAnyShipAabb(worldPosAbs);",
-            "        if (camRelIn || absIn) {",
-            "            vec3 worldPos = camRelIn ? worldPosCamRel : worldPosAbs;",
-            "            if (va_shouldDiscardForShip0(worldPos) || va_shouldDiscardForShip1(worldPos) ||",
-            "                va_shouldDiscardForShip2(worldPos) || va_shouldDiscardForShip3(worldPos)) {",
-            "                discard;",
-            "            }",
+            "        vec3 worldPos = " + VA_VAR_CAM_REL_POS + " + ValkyrienAir_CameraWorldPos;",
+            "        if (va_shouldDiscardForShip0(worldPos) || va_shouldDiscardForShip1(worldPos) ||",
+            "            va_shouldDiscardForShip2(worldPos) || va_shouldDiscardForShip3(worldPos)) {",
+            "            discard;",
             "        }",
             "    }"
         );
