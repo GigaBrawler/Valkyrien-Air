@@ -1,8 +1,6 @@
 package org.valkyrienskies.valkyrienair.mixin.client.renderer;
 
 import net.minecraft.client.renderer.ShaderInstance;
-import net.minecraft.client.Minecraft;
-import dev.architectury.platform.Platform;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
@@ -38,19 +36,6 @@ public abstract class MixinShaderInstance {
                     ShipWaterPocketExternalWaterCullRenderContext.getCamX(),
                     ShipWaterPocketExternalWaterCullRenderContext.getCamY(),
                     ShipWaterPocketExternalWaterCullRenderContext.getCamZ());
-                ShipWaterPocketExternalWaterCull.setShipPass(shader, ShipWaterPocketExternalWaterCullRenderContext.isInShipRender());
-                return;
-            }
-        }
-
-        // Embeddium can bypass LevelRenderer#renderChunkLayer, so the world translucent tracking may never be entered.
-        // If Embeddium is present and the patched translucent shader is being applied, treat it as the world translucent pass.
-        if (Platform.isModLoaded("embeddium") && "rendertype_translucent".equals(shader.getName())) {
-            final var minecraft = Minecraft.getInstance();
-            final var level = minecraft.level;
-            final var camera = minecraft.gameRenderer.getMainCamera();
-            if (level != null && camera != null) {
-                ShipWaterPocketExternalWaterCull.setupForWorldTranslucentPass(shader, level, camera);
                 ShipWaterPocketExternalWaterCull.setShipPass(shader, ShipWaterPocketExternalWaterCullRenderContext.isInShipRender());
                 return;
             }

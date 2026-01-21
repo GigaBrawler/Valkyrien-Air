@@ -4,9 +4,7 @@ import com.mojang.blaze3d.platform.GlStateManager;
 import com.mojang.blaze3d.platform.TextureUtil;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.shaders.Uniform;
-import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet;
-import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -28,19 +26,13 @@ import net.minecraft.world.inventory.InventoryMenu;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.phys.Vec3;
 import net.minecraft.world.phys.shapes.VoxelShape;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.joml.Matrix4dc;
 import org.joml.Matrix4f;
 import org.joml.primitives.AABBdc;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.opengl.GL11;
 import org.lwjgl.opengl.GL12;
-import org.lwjgl.opengl.GL13;
-import org.lwjgl.opengl.GL20;
 import org.lwjgl.opengl.GL30;
-import org.lwjgl.opengl.GL31;
-import org.lwjgl.opengl.GL32;
 import org.valkyrienskies.core.api.ships.ClientShip;
 import org.valkyrienskies.core.api.ships.LoadedShip;
 import org.valkyrienskies.core.api.ships.properties.ShipTransform;
@@ -55,10 +47,6 @@ import org.valkyrienskies.mod.common.VSGameUtilsKt;
 public final class ShipWaterPocketExternalWaterCull {
 
     private ShipWaterPocketExternalWaterCull() {}
-
-    private static final Logger LOG = LogManager.getLogger("ValkyrienAir ExternalWaterCull");
-    private static final java.util.Set<Integer> LOGGED_PROGRAM_IDS =
-        java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<>());
 
     private static final int MAX_SHIPS = 4;
     private static final int SUB = 8;
@@ -76,10 +64,6 @@ public final class ShipWaterPocketExternalWaterCull {
     private static final Matrix4f IDENTITY_MAT4 = new Matrix4f();
 
     private static ClientLevel lastLevel = null;
-    private static final Int2ObjectOpenHashMap<ProgramHandles> PROGRAM_HANDLES = new Int2ObjectOpenHashMap<>();
-    private static boolean programSupported = false;
-    private static final ThreadLocal<FloatBuffer> MATRIX_BUFFER =
-        ThreadLocal.withInitial(() -> BufferUtils.createFloatBuffer(16));
 
     private static final class ShipMasks {
         private final long shipId;
@@ -146,53 +130,10 @@ public final class ShipWaterPocketExternalWaterCull {
         private final Uniform[] worldToShip = new Uniform[MAX_SHIPS];
     }
 
-    private static final class ProgramHandles {
-        private final int programId;
-        private boolean supported;
-        private boolean maskUnitsAllocated;
-
-        private int cullEnabledLoc = -1;
-        private int isShipPassLoc = -1;
-        private int cameraWorldPosLoc = -1;
-        private int waterStillUvLoc = -1;
-        private int waterFlowUvLoc = -1;
-        private int waterOverlayUvLoc = -1;
-
-        private final int[] shipAabbMinLoc = new int[MAX_SHIPS];
-        private final int[] shipAabbMaxLoc = new int[MAX_SHIPS];
-        private final int[] cameraShipPosLoc = new int[MAX_SHIPS];
-        private final int[] gridMinLoc = new int[MAX_SHIPS];
-        private final int[] gridSizeLoc = new int[MAX_SHIPS];
-        private final int[] worldToShipLoc = new int[MAX_SHIPS];
-        private final int[] airMaskLoc = new int[MAX_SHIPS];
-        private final int[] occMaskLoc = new int[MAX_SHIPS];
-
-        private final int[] airMaskUnit = new int[MAX_SHIPS];
-        private final int[] occMaskUnit = new int[MAX_SHIPS];
-
-        private ProgramHandles(final int programId) {
-            this.programId = programId;
-            java.util.Arrays.fill(shipAabbMinLoc, -1);
-            java.util.Arrays.fill(shipAabbMaxLoc, -1);
-            java.util.Arrays.fill(cameraShipPosLoc, -1);
-            java.util.Arrays.fill(gridMinLoc, -1);
-            java.util.Arrays.fill(gridSizeLoc, -1);
-            java.util.Arrays.fill(worldToShipLoc, -1);
-            java.util.Arrays.fill(airMaskLoc, -1);
-            java.util.Arrays.fill(occMaskLoc, -1);
-            java.util.Arrays.fill(airMaskUnit, -1);
-            java.util.Arrays.fill(occMaskUnit, -1);
-        }
-    }
-
     private static final ShaderHandles SHADER = new ShaderHandles();
 
     private static boolean everEnabled = false;
     private static boolean shaderEverSupported = false;
-
-    private static boolean shouldLogProgramSupport() {
-        return Boolean.getBoolean("valkyrienair.debugEmbeddiumPrograms");
-    }
 
     public static void clear() {
         SHADER.shader = null;
@@ -200,8 +141,6 @@ public final class ShipWaterPocketExternalWaterCull {
 
         everEnabled = false;
         shaderEverSupported = false;
-        programSupported = false;
-        PROGRAM_HANDLES.clear();
 
         for (final ShipMasks masks : SHIP_MASKS.values()) {
             masks.close();
@@ -213,7 +152,7 @@ public final class ShipWaterPocketExternalWaterCull {
 
     public static boolean isShaderCullingActive() {
         if (!ValkyrienAirConfig.getEnableShipWaterPockets()) return false;
-        return (shaderEverSupported && everEnabled) || programSupported;
+        return shaderEverSupported && everEnabled;
     }
 
     public static void setupForWorldTranslucentPass(final ShaderInstance shader, final ClientLevel level, final Camera camera) {
@@ -252,72 +191,6 @@ public final class ShipWaterPocketExternalWaterCull {
 
         final List<LoadedShip> ships = selectClosestShips(level, cameraPos, MAX_SHIPS);
         updateShipUniformsAndMasks(level, ships, cameraX, cameraY, cameraZ);
-    }
-
-    public static void setupForWorldTranslucentPassProgram(final int programId, final ClientLevel level,
-        final double cameraX, final double cameraY, final double cameraZ) {
-        setupForWorldTranslucentPassProgram(programId, level, cameraX, cameraY, cameraZ, false);
-    }
-
-    public static void setupForWorldTranslucentPassProgram(final int programId, final ClientLevel level,
-        final double cameraX, final double cameraY, final double cameraZ, final boolean shipPass) {
-        if (level == null || programId == 0) return;
-
-        RenderSystem.assertOnRenderThread();
-
-        if (lastLevel != level) {
-            clear();
-            lastLevel = level;
-        }
-
-        final ProgramHandles handles = bindProgramHandles(programId);
-        if (shouldLogProgramSupport() && LOGGED_PROGRAM_IDS.add(programId)) {
-            LOG.info("Embeddium program {} water-cull uniforms supported={}", programId, handles.supported);
-        }
-        if (!handles.supported) return;
-
-        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) {
-            disableProgram(programId);
-            return;
-        }
-
-        if (!ensureMaskTextureUnits(handles)) {
-            disableProgram(programId);
-            return;
-        }
-
-        if (handles.cullEnabledLoc >= 0) {
-            GL20.glUniform1f(handles.cullEnabledLoc, 1.0f);
-        }
-        if (handles.isShipPassLoc >= 0) {
-            GL20.glUniform1f(handles.isShipPassLoc, shipPass ? 1.0f : 0.0f);
-        }
-        programSupported = true;
-
-        if (handles.cameraWorldPosLoc >= 0) {
-            GL20.glUniform3f(handles.cameraWorldPosLoc, (float) cameraX, (float) cameraY, (float) cameraZ);
-        }
-
-        final Vec3 cameraPos = new Vec3(cameraX, cameraY, cameraZ);
-        updateWaterUvProgram(handles);
-
-        final List<LoadedShip> ships = selectClosestShips(level, cameraPos, MAX_SHIPS);
-        updateShipUniformsAndMasksProgram(handles, level, ships, cameraX, cameraY, cameraZ);
-    }
-
-    public static void disableProgram(final int programId) {
-        if (programId == 0) return;
-        RenderSystem.assertOnRenderThread();
-
-        final ProgramHandles handles = PROGRAM_HANDLES.get(programId);
-        if (handles == null || !handles.supported) return;
-
-        if (handles.cullEnabledLoc >= 0) {
-            GL20.glUniform1f(handles.cullEnabledLoc, 0.0f);
-        }
-        if (handles.isShipPassLoc >= 0) {
-            GL20.glUniform1f(handles.isShipPassLoc, 0.0f);
-        }
     }
 
     public static void disable(final ShaderInstance shader) {
@@ -390,54 +263,6 @@ public final class ShipWaterPocketExternalWaterCull {
         shaderEverSupported = true;
     }
 
-    private static ProgramHandles bindProgramHandles(final int programId) {
-        ProgramHandles handles = PROGRAM_HANDLES.get(programId);
-        if (handles != null) return handles;
-
-        handles = new ProgramHandles(programId);
-        handles.cullEnabledLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_CullEnabled");
-        if (handles.cullEnabledLoc < 0) {
-            handles.supported = false;
-            PROGRAM_HANDLES.put(programId, handles);
-            return handles;
-        }
-
-        handles.isShipPassLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_IsShipPass");
-        handles.cameraWorldPosLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_CameraWorldPos");
-        handles.waterStillUvLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_WaterStillUv");
-        handles.waterFlowUvLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_WaterFlowUv");
-        handles.waterOverlayUvLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_WaterOverlayUv");
-
-        boolean ok = handles.isShipPassLoc >= 0;
-        ok &= handles.cameraWorldPosLoc >= 0;
-        ok &= handles.waterStillUvLoc >= 0;
-        ok &= handles.waterFlowUvLoc >= 0;
-        ok &= handles.waterOverlayUvLoc >= 0;
-
-        for (int i = 0; i < MAX_SHIPS; i++) {
-            handles.shipAabbMinLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipAabbMin" + i);
-            handles.shipAabbMaxLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipAabbMax" + i);
-            handles.cameraShipPosLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_CameraShipPos" + i);
-            handles.gridMinLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_GridMin" + i);
-            handles.gridSizeLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_GridSize" + i);
-            handles.worldToShipLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_WorldToShip" + i);
-            handles.airMaskLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_AirMask" + i);
-            handles.occMaskLoc[i] = GL20.glGetUniformLocation(programId, "ValkyrienAir_OccMask" + i);
-
-            ok &= handles.shipAabbMinLoc[i] >= 0;
-            ok &= handles.shipAabbMaxLoc[i] >= 0;
-            ok &= handles.gridMinLoc[i] >= 0;
-            ok &= handles.gridSizeLoc[i] >= 0;
-            ok &= handles.worldToShipLoc[i] >= 0;
-            ok &= handles.airMaskLoc[i] >= 0;
-            ok &= handles.occMaskLoc[i] >= 0;
-        }
-
-        handles.supported = ok;
-        PROGRAM_HANDLES.put(programId, handles);
-        return handles;
-    }
-
     private static void updateCameraAndWaterUv(final Vec3 cameraPos) {
         SHADER.cameraWorldPos.set((float) cameraPos.x, (float) cameraPos.y, (float) cameraPos.z);
         SHADER.cameraWorldPos.upload();
@@ -455,26 +280,6 @@ public final class ShipWaterPocketExternalWaterCull {
         SHADER.waterStillUv.upload();
         SHADER.waterFlowUv.upload();
         SHADER.waterOverlayUv.upload();
-    }
-
-    private static void updateWaterUvProgram(final ProgramHandles handles) {
-        if (handles.waterStillUvLoc < 0 && handles.waterFlowUvLoc < 0 && handles.waterOverlayUvLoc < 0) return;
-
-        final Function<ResourceLocation, TextureAtlasSprite> atlas =
-            Minecraft.getInstance().getTextureAtlas(InventoryMenu.BLOCK_ATLAS);
-        final TextureAtlasSprite still = atlas.apply(WATER_STILL);
-        final TextureAtlasSprite flow = atlas.apply(WATER_FLOW);
-        final TextureAtlasSprite overlay = atlas.apply(WATER_OVERLAY);
-
-        if (handles.waterStillUvLoc >= 0) {
-            GL20.glUniform4f(handles.waterStillUvLoc, still.getU0(), still.getV0(), still.getU1(), still.getV1());
-        }
-        if (handles.waterFlowUvLoc >= 0) {
-            GL20.glUniform4f(handles.waterFlowUvLoc, flow.getU0(), flow.getV0(), flow.getU1(), flow.getV1());
-        }
-        if (handles.waterOverlayUvLoc >= 0) {
-            GL20.glUniform4f(handles.waterOverlayUvLoc, overlay.getU0(), overlay.getV0(), overlay.getU1(), overlay.getV1());
-        }
     }
 
     private static List<LoadedShip> selectClosestShips(final ClientLevel level, final Vec3 cameraPos, final int maxCount) {
@@ -620,103 +425,6 @@ public final class ShipWaterPocketExternalWaterCull {
         });
     }
 
-    private static void updateShipUniformsAndMasksProgram(final ProgramHandles handles, final ClientLevel level,
-        final List<LoadedShip> ships, final double cameraX, final double cameraY, final double cameraZ) {
-        final long gameTime = level.getGameTime();
-
-        for (int slot = 0; slot < MAX_SHIPS; slot++) {
-            if (slot >= ships.size()) {
-                disableShipSlotProgram(handles, slot);
-                continue;
-            }
-
-            final LoadedShip ship = ships.get(slot);
-            final long shipId = ship.getId();
-
-            final AABBdc shipWorldAabbDc = getShipWorldAabb(ship).orElse(null);
-            if (shipWorldAabbDc == null) {
-                disableShipSlotProgram(handles, slot);
-                continue;
-            }
-
-            final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot =
-                ShipWaterPocketManager.getClientWaterReachableSnapshot(level, shipId);
-            if (snapshot == null) {
-                disableShipSlotProgram(handles, slot);
-                continue;
-            }
-
-            final ShipMasks masks = SHIP_MASKS.computeIfAbsent(shipId, ShipMasks::new);
-
-            final int minX = snapshot.getMinX();
-            final int minY = snapshot.getMinY();
-            final int minZ = snapshot.getMinZ();
-            final int sizeX = snapshot.getSizeX();
-            final int sizeY = snapshot.getSizeY();
-            final int sizeZ = snapshot.getSizeZ();
-            final long geometryRevision = snapshot.getGeometryRevision();
-
-            final boolean boundsChanged =
-                masks.minX != minX || masks.minY != minY || masks.minZ != minZ ||
-                    masks.sizeX != sizeX || masks.sizeY != sizeY || masks.sizeZ != sizeZ;
-
-            if (boundsChanged || masks.geometryRevision != geometryRevision) {
-                rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
-            }
-
-            final ShipTransform shipTransform = getShipTransform(ship);
-            final Matrix4dc worldToShip = shipTransform.getWorldToShip();
-            final double biasedM30 = worldToShip.m30() - (double) minX;
-            final double biasedM31 = worldToShip.m31() - (double) minY;
-            final double biasedM32 = worldToShip.m32() - (double) minZ;
-            final long airKey = computeAirKey(geometryRevision, worldToShip, biasedM30, biasedM31, biasedM32);
-
-            updateAirMask(level, masks, snapshot, shipTransform, gameTime, airKey);
-
-            bindProgramMaskTextures(handles, slot, masks);
-
-            if (handles.shipAabbMinLoc[slot] >= 0) {
-                GL20.glUniform4f(handles.shipAabbMinLoc[slot],
-                    (float) shipWorldAabbDc.minX(), (float) shipWorldAabbDc.minY(), (float) shipWorldAabbDc.minZ(), 0.0f);
-            }
-            if (handles.shipAabbMaxLoc[slot] >= 0) {
-                GL20.glUniform4f(handles.shipAabbMaxLoc[slot],
-                    (float) shipWorldAabbDc.maxX(), (float) shipWorldAabbDc.maxY(), (float) shipWorldAabbDc.maxZ(), 0.0f);
-            }
-            if (handles.gridMinLoc[slot] >= 0) {
-                GL20.glUniform4f(handles.gridMinLoc[slot], 0.0f, 0.0f, 0.0f, 0.0f);
-            }
-            if (handles.gridSizeLoc[slot] >= 0) {
-                GL20.glUniform4f(handles.gridSizeLoc[slot], (float) sizeX, (float) sizeY, (float) sizeZ, 0.0f);
-            }
-
-            masks.worldToShip.set(
-                (float) worldToShip.m00(), (float) worldToShip.m01(), (float) worldToShip.m02(), (float) worldToShip.m03(),
-                (float) worldToShip.m10(), (float) worldToShip.m11(), (float) worldToShip.m12(), (float) worldToShip.m13(),
-                (float) worldToShip.m20(), (float) worldToShip.m21(), (float) worldToShip.m22(), (float) worldToShip.m23(),
-                (float) biasedM30, (float) biasedM31, (float) biasedM32, (float) worldToShip.m33()
-            );
-            uploadMatrixUniform(handles.worldToShipLoc[slot], masks.worldToShip);
-
-            if (handles.cameraShipPosLoc[slot] >= 0) {
-                final double camShipX = worldToShip.m00() * cameraX + worldToShip.m10() * cameraY + worldToShip.m20() * cameraZ + biasedM30;
-                final double camShipY = worldToShip.m01() * cameraX + worldToShip.m11() * cameraY + worldToShip.m21() * cameraZ + biasedM31;
-                final double camShipZ = worldToShip.m02() * cameraX + worldToShip.m12() * cameraY + worldToShip.m22() * cameraZ + biasedM32;
-                GL20.glUniform3f(handles.cameraShipPosLoc[slot], (float) camShipX, (float) camShipY, (float) camShipZ);
-            }
-        }
-
-        final LongOpenHashSet loadedIds = new LongOpenHashSet();
-        for (final LoadedShip loadedShip : VSGameUtilsKt.getShipObjectWorld(level).getLoadedShips()) {
-            loadedIds.add(loadedShip.getId());
-        }
-        SHIP_MASKS.entrySet().removeIf(entry -> {
-            if (loadedIds.contains(entry.getKey())) return false;
-            entry.getValue().close();
-            return true;
-        });
-    }
-
     private static void disableShipSlot(final int slot) {
         SHADER.shader.setSampler("ValkyrienAir_AirMask" + slot, 0);
         SHADER.shader.setSampler("ValkyrienAir_OccMask" + slot, 0);
@@ -734,169 +442,6 @@ public final class ShipWaterPocketExternalWaterCull {
         SHADER.gridMin[slot].upload();
         SHADER.gridSize[slot].upload();
         SHADER.worldToShip[slot].upload();
-    }
-
-    private static void disableShipSlotProgram(final ProgramHandles handles, final int slot) {
-        if (handles.airMaskLoc[slot] >= 0) {
-            GL20.glUniform1i(handles.airMaskLoc[slot], 0);
-        }
-        if (handles.occMaskLoc[slot] >= 0) {
-            GL20.glUniform1i(handles.occMaskLoc[slot], 0);
-        }
-
-        final int airUnit = handles.airMaskUnit[slot];
-        final int occUnit = handles.occMaskUnit[slot];
-        if (airUnit >= 0 && occUnit >= 0) {
-            final int prevActive = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
-            GL13.glActiveTexture(GL13.GL_TEXTURE0 + airUnit);
-            GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
-            GL13.glActiveTexture(GL13.GL_TEXTURE0 + occUnit);
-            GL11.glBindTexture(GL11.GL_TEXTURE_2D, 0);
-            GL13.glActiveTexture(prevActive);
-        }
-
-        if (handles.shipAabbMinLoc[slot] >= 0) {
-            GL20.glUniform4f(handles.shipAabbMinLoc[slot], 0.0f, 0.0f, 0.0f, 0.0f);
-        }
-        if (handles.shipAabbMaxLoc[slot] >= 0) {
-            GL20.glUniform4f(handles.shipAabbMaxLoc[slot], -1.0f, -1.0f, -1.0f, 0.0f);
-        }
-        if (handles.gridMinLoc[slot] >= 0) {
-            GL20.glUniform4f(handles.gridMinLoc[slot], 0.0f, 0.0f, 0.0f, 0.0f);
-        }
-        if (handles.gridSizeLoc[slot] >= 0) {
-            GL20.glUniform4f(handles.gridSizeLoc[slot], 0.0f, 0.0f, 0.0f, 0.0f);
-        }
-        if (handles.cameraShipPosLoc[slot] >= 0) {
-            GL20.glUniform3f(handles.cameraShipPosLoc[slot], 0.0f, 0.0f, 0.0f);
-        }
-        uploadMatrixUniform(handles.worldToShipLoc[slot], IDENTITY_MAT4);
-    }
-
-    private static void bindProgramMaskTextures(final ProgramHandles handles, final int slot, final ShipMasks masks) {
-        final int airUnit = handles.airMaskUnit[slot];
-        final int occUnit = handles.occMaskUnit[slot];
-        if (airUnit < 0 || occUnit < 0) return;
-
-        if (handles.airMaskLoc[slot] >= 0) {
-            GL20.glUniform1i(handles.airMaskLoc[slot], airUnit);
-        }
-        if (handles.occMaskLoc[slot] >= 0) {
-            GL20.glUniform1i(handles.occMaskLoc[slot], occUnit);
-        }
-
-        final int prevActive = GL11.glGetInteger(GL13.GL_ACTIVE_TEXTURE);
-        GL13.glActiveTexture(GL13.GL_TEXTURE0 + airUnit);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, masks.airTexId);
-        GL13.glActiveTexture(GL13.GL_TEXTURE0 + occUnit);
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, masks.occTexId);
-        GL13.glActiveTexture(prevActive);
-    }
-
-    private static boolean ensureMaskTextureUnits(final ProgramHandles handles) {
-        if (handles.maskUnitsAllocated) return true;
-
-        final int maxUnits = GL11.glGetInteger(GL20.GL_MAX_TEXTURE_IMAGE_UNITS);
-        if (maxUnits <= 0) return false;
-
-        final boolean[] used = new boolean[maxUnits];
-        markUsedTextureUnits(handles.programId, used);
-
-        final int neededUnits = MAX_SHIPS * 2;
-        final int[] allocated = new int[neededUnits];
-        int found = 0;
-
-        for (int unit = maxUnits - 1; unit >= 0 && found < neededUnits; unit--) {
-            if (used[unit]) continue;
-            allocated[found++] = unit;
-            used[unit] = true;
-        }
-
-        if (found < neededUnits) return false;
-
-        for (int slot = 0; slot < MAX_SHIPS; slot++) {
-            handles.airMaskUnit[slot] = allocated[slot * 2];
-            handles.occMaskUnit[slot] = allocated[slot * 2 + 1];
-        }
-
-        handles.maskUnitsAllocated = true;
-        return true;
-    }
-
-    private static void markUsedTextureUnits(final int programId, final boolean[] usedUnits) {
-        final int uniformCount = GL20.glGetProgrami(programId, GL20.GL_ACTIVE_UNIFORMS);
-        final IntBuffer sizeBuf = BufferUtils.createIntBuffer(1);
-        final IntBuffer typeBuf = BufferUtils.createIntBuffer(1);
-
-        for (int i = 0; i < uniformCount; i++) {
-            sizeBuf.clear();
-            typeBuf.clear();
-            final String name = GL20.glGetActiveUniform(programId, i, sizeBuf, typeBuf);
-            if (name == null || name.isEmpty()) continue;
-
-            final int type = typeBuf.get(0);
-            if (!isSamplerUniformType(type)) continue;
-
-            final int location = GL20.glGetUniformLocation(programId, name);
-            if (location < 0) continue;
-
-            final int count = Math.max(1, sizeBuf.get(0));
-            final int[] values = new int[count];
-            GL20.glGetUniformiv(programId, location, values);
-
-            for (final int value : values) {
-                if (value < 0 || value >= usedUnits.length) continue;
-                usedUnits[value] = true;
-            }
-        }
-    }
-
-    private static boolean isSamplerUniformType(final int type) {
-        return type == GL20.GL_SAMPLER_1D ||
-            type == GL20.GL_SAMPLER_2D ||
-            type == GL20.GL_SAMPLER_3D ||
-            type == GL20.GL_SAMPLER_CUBE ||
-            type == GL20.GL_SAMPLER_1D_SHADOW ||
-            type == GL20.GL_SAMPLER_2D_SHADOW ||
-            type == GL30.GL_SAMPLER_1D_ARRAY ||
-            type == GL30.GL_SAMPLER_2D_ARRAY ||
-            type == GL30.GL_SAMPLER_1D_ARRAY_SHADOW ||
-            type == GL30.GL_SAMPLER_2D_ARRAY_SHADOW ||
-            type == GL30.GL_SAMPLER_CUBE_SHADOW ||
-            type == GL31.GL_SAMPLER_BUFFER ||
-            type == GL31.GL_SAMPLER_2D_RECT ||
-            type == GL31.GL_SAMPLER_2D_RECT_SHADOW ||
-            type == GL32.GL_SAMPLER_2D_MULTISAMPLE ||
-            type == GL32.GL_SAMPLER_2D_MULTISAMPLE_ARRAY ||
-            type == GL30.GL_INT_SAMPLER_1D ||
-            type == GL30.GL_INT_SAMPLER_2D ||
-            type == GL30.GL_INT_SAMPLER_3D ||
-            type == GL30.GL_INT_SAMPLER_CUBE ||
-            type == GL30.GL_INT_SAMPLER_1D_ARRAY ||
-            type == GL30.GL_INT_SAMPLER_2D_ARRAY ||
-            type == GL31.GL_INT_SAMPLER_2D_RECT ||
-            type == GL31.GL_INT_SAMPLER_BUFFER ||
-            type == GL32.GL_INT_SAMPLER_2D_MULTISAMPLE ||
-            type == GL32.GL_INT_SAMPLER_2D_MULTISAMPLE_ARRAY ||
-            type == GL30.GL_UNSIGNED_INT_SAMPLER_1D ||
-            type == GL30.GL_UNSIGNED_INT_SAMPLER_2D ||
-            type == GL30.GL_UNSIGNED_INT_SAMPLER_3D ||
-            type == GL30.GL_UNSIGNED_INT_SAMPLER_CUBE ||
-            type == GL30.GL_UNSIGNED_INT_SAMPLER_1D_ARRAY ||
-            type == GL30.GL_UNSIGNED_INT_SAMPLER_2D_ARRAY ||
-            type == GL31.GL_UNSIGNED_INT_SAMPLER_2D_RECT ||
-            type == GL31.GL_UNSIGNED_INT_SAMPLER_BUFFER ||
-            type == GL32.GL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE ||
-            type == GL32.GL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE_ARRAY;
-    }
-
-    private static void uploadMatrixUniform(final int location, final Matrix4f matrix) {
-        if (location < 0) return;
-        final FloatBuffer buffer = MATRIX_BUFFER.get();
-        buffer.clear();
-        matrix.get(buffer);
-        buffer.flip();
-        GL20.glUniformMatrix4fv(location, false, buffer);
     }
 
     private static void rebuildOccMask(final ClientLevel level, final ShipMasks masks, final int minX, final int minY,
