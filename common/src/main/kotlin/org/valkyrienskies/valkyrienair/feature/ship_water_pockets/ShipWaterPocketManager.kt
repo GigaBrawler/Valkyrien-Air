@@ -42,7 +42,10 @@ object ShipWaterPocketManager {
     private const val MAX_SIM_VOLUME = 2_000_000
     private const val POCKET_BOUNDS_PADDING = 1
     private const val AIR_PRESSURE_Y_EPS = 1e-7
-    private const val WALL_HOLE_MIN_LATERAL_SOLIDS = 3
+    // How "tight" a submerged wall opening must look (out of the 4 lateral directions around the opening axis)
+    // to be treated as a hull wall-hole that ignores air pressure. Keep this permissive enough to catch openings
+    // in complex geometry (corners/edges), but restrictive enough to avoid classifying generic exterior water contact.
+    private const val WALL_HOLE_MIN_LATERAL_SOLIDS = 2
 
     @Volatile
     private var applyingInternalUpdates: Boolean = false
@@ -899,10 +902,18 @@ object ShipWaterPocketManager {
             // submerged wall holes always flood regardless of trapped air.
             //
             // IMPORTANT: We must detect actual hull openings, not just "this component is big enough that boundary water
-            // can move inward". Use the padded AABB (POCKET_BOUNDS_PADDING=1): a true hull hole shows up as an open cell
-            // 1 block in from the sim bounds, with submerged open space on the outside neighbor and solid blocks around
-            // the opening (lateral to the hole axis).
+            // can move inward".
+            //
+            // In simple geometry, a hull wall hole is often 1 block in from the padded sim bounds (POCKET_BOUNDS_PADDING=1),
+            // but with complex ships the AABB can be extended by protrusions, and a real exterior wall can be recessed
+            // many blocks from the AABB face. Detect holes at any depth by requiring:
+            // - the opening looks like a tight passage (solid blocks lateral to the axis),
+            // - there is submerged open space on the outside side, and
+            // - there is an unobstructed open line from that outside side to the sim bounds face (same slice), and
+            // - the "inside" side is not just empty space all the way to the opposite bounds face (helps avoid false
+            //   positives in outside-of-ship cavities created by complex ship AABBs).
             var hasSubmergedWallHole = false
+            var wallHoleSeedIdx = -1
 
             fun lateralSolidCountForX(idx: Int, ly: Int, lz: Int): Int {
                 var solids = 0
@@ -931,6 +942,72 @@ object ShipWaterPocketManager {
                 return solids
             }
 
+            fun openLineToMinX(fromIdx: Int, fromLx: Int): Boolean {
+                var idx = fromIdx
+                var lx = fromLx
+                while (lx >= 0) {
+                    if (!open.get(idx)) return false
+                    idx--
+                    lx--
+                }
+                return true
+            }
+
+            fun openLineToMaxX(fromIdx: Int, fromLx: Int): Boolean {
+                var idx = fromIdx
+                var lx = fromLx
+                while (lx < sizeX) {
+                    if (!open.get(idx)) return false
+                    idx++
+                    lx++
+                }
+                return true
+            }
+
+            fun openLineToMinY(fromIdx: Int, fromLy: Int): Boolean {
+                var idx = fromIdx
+                var ly = fromLy
+                while (ly >= 0) {
+                    if (!open.get(idx)) return false
+                    idx -= strideY
+                    ly--
+                }
+                return true
+            }
+
+            fun openLineToMaxY(fromIdx: Int, fromLy: Int): Boolean {
+                var idx = fromIdx
+                var ly = fromLy
+                while (ly < sizeY) {
+                    if (!open.get(idx)) return false
+                    idx += strideY
+                    ly++
+                }
+                return true
+            }
+
+            fun openLineToMinZ(fromIdx: Int, fromLz: Int): Boolean {
+                var idx = fromIdx
+                var lz = fromLz
+                while (lz >= 0) {
+                    if (!open.get(idx)) return false
+                    idx -= strideZ
+                    lz--
+                }
+                return true
+            }
+
+            fun openLineToMaxZ(fromIdx: Int, fromLz: Int): Boolean {
+                var idx = fromIdx
+                var lz = fromLz
+                while (lz < sizeZ) {
+                    if (!open.get(idx)) return false
+                    idx += strideZ
+                    lz++
+                }
+                return true
+            }
+
             for (i in 0 until componentSize) {
                 val idx = componentQueue[i]
                 if (!submerged.get(idx)) continue
@@ -941,66 +1018,93 @@ object ShipWaterPocketManager {
                 if (isBoundary(lx, ly, lz)) continue
 
                 if (isWallFaceX && sizeX > 2) {
-                    if (lx == 1) {
+                    val distMin = lx
+                    val distMax = sizeX - 1 - lx
+                    if (distMin <= distMax && lx > 0 && lx + 1 < sizeX) {
                         val outIdx = idx - 1
                         val inIdx = idx + 1
                         if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
                             if (lateralSolidCountForX(idx, ly, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
-                                hasSubmergedWallHole = true
-                                break
+                                if (openLineToMinX(outIdx, lx - 1) && !openLineToMaxX(inIdx, lx + 1)) {
+                                    hasSubmergedWallHole = true
+                                    wallHoleSeedIdx = idx
+                                    break
+                                }
                             }
                         }
-                    } else if (lx == sizeX - 2) {
+                    }
+                    if (distMax <= distMin && lx > 0 && lx + 1 < sizeX) {
                         val outIdx = idx + 1
                         val inIdx = idx - 1
                         if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
                             if (lateralSolidCountForX(idx, ly, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
-                                hasSubmergedWallHole = true
-                                break
+                                if (openLineToMaxX(outIdx, lx + 1) && !openLineToMinX(inIdx, lx - 1)) {
+                                    hasSubmergedWallHole = true
+                                    wallHoleSeedIdx = idx
+                                    break
+                                }
                             }
                         }
                     }
                 }
 
                 if (isWallFaceY && sizeY > 2) {
-                    if (ly == 1) {
+                    val distMin = ly
+                    val distMax = sizeY - 1 - ly
+                    if (distMin <= distMax && ly > 0 && ly + 1 < sizeY) {
                         val outIdx = idx - strideY
                         val inIdx = idx + strideY
                         if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
                             if (lateralSolidCountForY(idx, lx, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
-                                hasSubmergedWallHole = true
-                                break
+                                if (openLineToMinY(outIdx, ly - 1) && !openLineToMaxY(inIdx, ly + 1)) {
+                                    hasSubmergedWallHole = true
+                                    wallHoleSeedIdx = idx
+                                    break
+                                }
                             }
                         }
-                    } else if (ly == sizeY - 2) {
+                    }
+                    if (distMax <= distMin && ly > 0 && ly + 1 < sizeY) {
                         val outIdx = idx + strideY
                         val inIdx = idx - strideY
                         if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
                             if (lateralSolidCountForY(idx, lx, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
-                                hasSubmergedWallHole = true
-                                break
+                                if (openLineToMaxY(outIdx, ly + 1) && !openLineToMinY(inIdx, ly - 1)) {
+                                    hasSubmergedWallHole = true
+                                    wallHoleSeedIdx = idx
+                                    break
+                                }
                             }
                         }
                     }
                 }
 
                 if (isWallFaceZ && sizeZ > 2) {
-                    if (lz == 1) {
+                    val distMin = lz
+                    val distMax = sizeZ - 1 - lz
+                    if (distMin <= distMax && lz > 0 && lz + 1 < sizeZ) {
                         val outIdx = idx - strideZ
                         val inIdx = idx + strideZ
                         if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
                             if (lateralSolidCountForZ(idx, lx, ly) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
-                                hasSubmergedWallHole = true
-                                break
+                                if (openLineToMinZ(outIdx, lz - 1) && !openLineToMaxZ(inIdx, lz + 1)) {
+                                    hasSubmergedWallHole = true
+                                    wallHoleSeedIdx = idx
+                                    break
+                                }
                             }
                         }
-                    } else if (lz == sizeZ - 2) {
+                    }
+                    if (distMax <= distMin && lz > 0 && lz + 1 < sizeZ) {
                         val outIdx = idx + strideZ
                         val inIdx = idx - strideZ
                         if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
                             if (lateralSolidCountForZ(idx, lx, ly) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
-                                hasSubmergedWallHole = true
-                                break
+                                if (openLineToMaxZ(outIdx, lz + 1) && !openLineToMinZ(inIdx, lz - 1)) {
+                                    hasSubmergedWallHole = true
+                                    wallHoleSeedIdx = idx
+                                    break
+                                }
                             }
                         }
                     }
@@ -1018,6 +1122,10 @@ object ShipWaterPocketManager {
                     if (!submerged.get(idx)) return
                     out.set(idx)
                     waterQueue[waterTail++] = idx
+                }
+
+                if (wallHoleSeedIdx >= 0) {
+                    tryEnqueueWater(wallHoleSeedIdx)
                 }
 
                 for (i in 0 until componentSize) {
