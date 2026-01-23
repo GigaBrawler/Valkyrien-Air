@@ -40,6 +40,8 @@ object ShipWaterPocketManager {
 
     private const val FLOOD_UPDATE_INTERVAL_TICKS = 10L
     private const val MAX_SIM_VOLUME = 2_000_000
+    private const val POCKET_BOUNDS_PADDING = 1
+    private const val AIR_PRESSURE_Y_EPS = 1e-7
 
     @Volatile
     private var applyingInternalUpdates: Boolean = false
@@ -73,6 +75,11 @@ object ShipWaterPocketManager {
     private val tmpShipBlockPos: ThreadLocal<BlockPos.MutableBlockPos> =
         ThreadLocal.withInitial { BlockPos.MutableBlockPos() }
     private val tmpFloodQueue: ThreadLocal<IntArray> = ThreadLocal.withInitial { IntArray(0) }
+    private val tmpPressureComponentVisited: ThreadLocal<BitSet> = ThreadLocal.withInitial { BitSet() }
+    private val tmpPressureSubmerged: ThreadLocal<BitSet> = ThreadLocal.withInitial { BitSet() }
+    private val tmpPressureEscapeHeight: ThreadLocal<DoubleArray> = ThreadLocal.withInitial { DoubleArray(0) }
+    private val tmpPressureHeapIdx: ThreadLocal<IntArray> = ThreadLocal.withInitial { IntArray(0) }
+    private val tmpPressureHeapPos: ThreadLocal<IntArray> = ThreadLocal.withInitial { IntArray(0) }
 
     private const val POINT_QUERY_EPS: Double = 1e-5
 
@@ -99,9 +106,19 @@ object ShipWaterPocketManager {
             val state = states.computeIfAbsent(ship.id) { ShipPocketState() }
 
             val aabb = ship.shipAABB ?: return@forEach
-            val sizeX = aabb.maxX() - aabb.minX()
-            val sizeY = aabb.maxY() - aabb.minY()
-            val sizeZ = aabb.maxZ() - aabb.minZ()
+            val baseMinX = aabb.minX()
+            val baseMinY = aabb.minY()
+            val baseMinZ = aabb.minZ()
+            val baseSizeX = aabb.maxX() - baseMinX
+            val baseSizeY = aabb.maxY() - baseMinY
+            val baseSizeZ = aabb.maxZ() - baseMinZ
+
+            val minX = baseMinX - POCKET_BOUNDS_PADDING
+            val minY = baseMinY - POCKET_BOUNDS_PADDING
+            val minZ = baseMinZ - POCKET_BOUNDS_PADDING
+            val sizeX = baseSizeX + POCKET_BOUNDS_PADDING * 2
+            val sizeY = baseSizeY + POCKET_BOUNDS_PADDING * 2
+            val sizeZ = baseSizeZ + POCKET_BOUNDS_PADDING * 2
             val volume = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
             if (volume <= 0 || volume > MAX_SIM_VOLUME.toLong()) {
                 if (state.dirty) {
@@ -112,9 +129,9 @@ object ShipWaterPocketManager {
             }
 
             val needsRecompute = state.dirty || state.sizeX != sizeX || state.sizeY != sizeY || state.sizeZ != sizeZ ||
-                state.minX != aabb.minX() || state.minY != aabb.minY() || state.minZ != aabb.minZ()
+                state.minX != minX || state.minY != minY || state.minZ != minZ
             if (needsRecompute) {
-                recomputeState(level, ship, state, aabb.minX(), aabb.minY(), aabb.minZ(), sizeX, sizeY, sizeZ)
+                recomputeState(level, ship, state, minX, minY, minZ, sizeX, sizeY, sizeZ)
             }
 
             val now = level.gameTime
@@ -146,12 +163,19 @@ object ShipWaterPocketManager {
             val state = states.computeIfAbsent(ship.id) { ShipPocketState() }
 
             val aabb = ship.shipAABB ?: return@forEach
-            val minX = aabb.minX()
-            val minY = aabb.minY()
-            val minZ = aabb.minZ()
-            val sizeX = aabb.maxX() - minX
-            val sizeY = aabb.maxY() - minY
-            val sizeZ = aabb.maxZ() - minZ
+            val baseMinX = aabb.minX()
+            val baseMinY = aabb.minY()
+            val baseMinZ = aabb.minZ()
+            val baseSizeX = aabb.maxX() - baseMinX
+            val baseSizeY = aabb.maxY() - baseMinY
+            val baseSizeZ = aabb.maxZ() - baseMinZ
+
+            val minX = baseMinX - POCKET_BOUNDS_PADDING
+            val minY = baseMinY - POCKET_BOUNDS_PADDING
+            val minZ = baseMinZ - POCKET_BOUNDS_PADDING
+            val sizeX = baseSizeX + POCKET_BOUNDS_PADDING * 2
+            val sizeY = baseSizeY + POCKET_BOUNDS_PADDING * 2
+            val sizeZ = baseSizeZ + POCKET_BOUNDS_PADDING * 2
             val volume = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
             if (volume <= 0 || volume > MAX_SIM_VOLUME.toLong()) {
                 state.dirty = false
@@ -166,7 +190,7 @@ object ShipWaterPocketManager {
                 // If we recompute while those chunks are still unloaded, `getBlockState` returns air everywhere, which
                 // makes the ship appear entirely "open" and disables all air pockets until another shipyard block
                 // update marks the ship dirty again.
-                if (!areShipyardChunksLoaded(level, minX, minY, minZ, sizeX, sizeY, sizeZ)) {
+                if (!areShipyardChunksLoaded(level, baseMinX, baseMinY, baseMinZ, baseSizeX, baseSizeY, baseSizeZ)) {
                     state.dirty = true
                 } else {
                     recomputeState(level, ship, state, minX, minY, minZ, sizeX, sizeY, sizeZ)
@@ -689,28 +713,54 @@ object ShipWaterPocketManager {
         }
     }
 
-    private fun computeWaterReachable(
+    private fun computeWaterReachableWithPressure(
         level: Level,
-        state: ShipPocketState,
+        minX: Int,
+        minY: Int,
+        minZ: Int,
+        sizeX: Int,
+        sizeY: Int,
+        sizeZ: Int,
+        open: BitSet,
         shipTransform: ShipTransform,
+        out: BitSet,
     ): BitSet {
-        val open = state.open
-        val out = state.waterReachable
         out.clear()
+
+        val volumeLong = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
+        if (volumeLong <= 0 || volumeLong > MAX_SIM_VOLUME.toLong()) return out
         if (open.isEmpty) return out
 
-        val sizeX = state.sizeX
-        val sizeY = state.sizeY
-        val sizeZ = state.sizeZ
-        val volume = sizeX * sizeY * sizeZ
+        val volume = volumeLong.toInt()
 
-        var queue = tmpFloodQueue.get()
-        if (queue.size < volume) {
-            queue = IntArray(volume)
-            tmpFloodQueue.set(queue)
+        var componentQueue = tmpFloodQueue.get()
+        if (componentQueue.size < volume) {
+            componentQueue = IntArray(volume)
+            tmpFloodQueue.set(componentQueue)
         }
-        var head = 0
-        var tail = 0
+
+        val componentVisited = tmpPressureComponentVisited.get()
+        componentVisited.clear()
+
+        val submerged = tmpPressureSubmerged.get()
+        submerged.clear()
+
+        var escapeHeight = tmpPressureEscapeHeight.get()
+        if (escapeHeight.size < volume) {
+            escapeHeight = DoubleArray(volume)
+            tmpPressureEscapeHeight.set(escapeHeight)
+        }
+
+        var heapIdx = tmpPressureHeapIdx.get()
+        if (heapIdx.size < volume) {
+            heapIdx = IntArray(volume)
+            tmpPressureHeapIdx.set(heapIdx)
+        }
+        var heapPos = tmpPressureHeapPos.get()
+        if (heapPos.size < volume) {
+            heapPos = IntArray(volume)
+            tmpPressureHeapPos.set(heapPos)
+        }
 
         val worldPosTmp = Vector3d()
         val shipPosTmp = Vector3d()
@@ -718,40 +768,270 @@ object ShipWaterPocketManager {
         val worldBlockPos = BlockPos.MutableBlockPos()
 
         fun shipCellSubmerged(idx: Int): Boolean {
-            posFromIndex(state, idx, shipBlockPos)
-            return isShipCellSubmergedInWorldWater(level, shipTransform, shipBlockPos, shipPosTmp, worldPosTmp, worldBlockPos)
-        }
-
-        fun tryEnqueue(idx: Int) {
-            if (!open.get(idx) || out.get(idx)) return
-            if (!shipCellSubmerged(idx)) return
-            out.set(idx)
-            queue[tail++] = idx
-        }
-
-        // Seed from boundary open cells that are submerged in world water; then flood-fill through submerged open cells.
-        forEachBoundaryIndex(sizeX, sizeY, sizeZ) { idx -> tryEnqueue(idx) }
-
-        val strideY = sizeX
-        val strideZ = sizeX * sizeY
-
-        while (head < tail) {
-            val idx = queue[head++]
-
             val lx = idx % sizeX
             val t = idx / sizeX
             val ly = t % sizeY
             val lz = t / sizeY
+            shipBlockPos.set(minX + lx, minY + ly, minZ + lz)
+            return isShipCellSubmergedInWorldWater(
+                level,
+                shipTransform,
+                shipBlockPos,
+                shipPosTmp,
+                worldPosTmp,
+                worldBlockPos,
+            )
+        }
 
-            if (lx > 0) tryEnqueue(idx - 1)
-            if (lx + 1 < sizeX) tryEnqueue(idx + 1)
-            if (ly > 0) tryEnqueue(idx - strideY)
-            if (ly + 1 < sizeY) tryEnqueue(idx + strideY)
-            if (lz > 0) tryEnqueue(idx - strideZ)
-            if (lz + 1 < sizeZ) tryEnqueue(idx + strideZ)
+        // Cache which open cells are submerged in world water. We use this mask many times and it is much cheaper to
+        // query a BitSet than to re-run the world sampling logic.
+        var idx = open.nextSetBit(0)
+        while (idx >= 0 && idx < volume) {
+            if (shipCellSubmerged(idx)) submerged.set(idx)
+            idx = open.nextSetBit(idx + 1)
+        }
+
+        // World-space Y is an affine function of ship-space x/y/z. Sample it once to get a fast linear map.
+        fun worldYAtShipPos(x: Double, y: Double, z: Double): Double {
+            shipPosTmp.set(x, y, z)
+            shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+            return worldPosTmp.y
+        }
+
+        val baseShipX = minX + 0.5
+        val baseShipY = minY + 0.5
+        val baseShipZ = minZ + 0.5
+        val baseWorldY = worldYAtShipPos(baseShipX, baseShipY, baseShipZ)
+        val incX = worldYAtShipPos(baseShipX + 1.0, baseShipY, baseShipZ) - baseWorldY
+        val incY = worldYAtShipPos(baseShipX, baseShipY + 1.0, baseShipZ) - baseWorldY
+        val incZ = worldYAtShipPos(baseShipX, baseShipY, baseShipZ + 1.0) - baseWorldY
+        val maxStepWorldY = maxOf(kotlin.math.abs(incX), kotlin.math.abs(incY), kotlin.math.abs(incZ))
+
+        val strideY = sizeX
+        val strideZ = sizeX * sizeY
+
+        fun isBoundary(lx: Int, ly: Int, lz: Int): Boolean {
+            return lx == 0 || lx + 1 == sizeX || ly == 0 || ly + 1 == sizeY || lz == 0 || lz + 1 == sizeZ
+        }
+
+        // Analyze each open component that is exposed to world water on the bounds.
+        forEachBoundaryIndex(sizeX, sizeY, sizeZ) { boundaryIdx ->
+            if (!open.get(boundaryIdx)) return@forEachBoundaryIndex
+            if (componentVisited.get(boundaryIdx)) return@forEachBoundaryIndex
+            if (!submerged.get(boundaryIdx)) return@forEachBoundaryIndex
+
+            // Flood-fill the full connected open component.
+            var head = 0
+            var tail = 0
+            componentVisited.set(boundaryIdx)
+            componentQueue[tail++] = boundaryIdx
+
+            fun enqueueComponent(idx: Int) {
+                if (!open.get(idx) || componentVisited.get(idx)) return
+                componentVisited.set(idx)
+                componentQueue[tail++] = idx
+            }
+
+            while (head < tail) {
+                val idx = componentQueue[head++]
+
+                val lx = idx % sizeX
+                val t = idx / sizeX
+                val ly = t % sizeY
+                val lz = t / sizeY
+
+                if (lx > 0) enqueueComponent(idx - 1)
+                if (lx + 1 < sizeX) enqueueComponent(idx + 1)
+                if (ly > 0) enqueueComponent(idx - strideY)
+                if (ly + 1 < sizeY) enqueueComponent(idx + strideY)
+                if (lz > 0) enqueueComponent(idx - strideZ)
+                if (lz + 1 < sizeZ) enqueueComponent(idx + strideZ)
+            }
+
+            val componentSize = tail
+            if (componentSize <= 0) return@forEachBoundaryIndex
+
+            // Compute, for each cell in the component, the highest world-space Y-level L such that there exists a path
+            // from that cell to the bounds that never goes below L (a maximin "escape height").
+            //
+            // Water can only rise into a cell if the cell height is <= its escape height; otherwise filling it would
+            // require the trapped air to dip below the would-be water level.
+            for (i in 0 until componentSize) {
+                escapeHeight[componentQueue[i]] = Double.NEGATIVE_INFINITY
+            }
+            for (i in 0 until componentSize) {
+                heapPos[componentQueue[i]] = -1
+            }
+
+            var heapSize = 0
+
+            fun heapSwap(i: Int, j: Int) {
+                val a = heapIdx[i]
+                val b = heapIdx[j]
+                heapIdx[i] = b
+                heapIdx[j] = a
+                heapPos[a] = j
+                heapPos[b] = i
+            }
+
+            fun heapBubbleUp(i0: Int) {
+                var i = i0
+                while (i > 0) {
+                    val parent = (i - 1) ushr 1
+                    if (escapeHeight[heapIdx[parent]] >= escapeHeight[heapIdx[i]]) break
+                    heapSwap(i, parent)
+                    i = parent
+                }
+            }
+
+            fun heapBubbleDown(i0: Int) {
+                var i = i0
+                while (true) {
+                    val left = i * 2 + 1
+                    if (left >= heapSize) break
+                    val right = left + 1
+                    var child = left
+                    if (right < heapSize && escapeHeight[heapIdx[right]] > escapeHeight[heapIdx[left]]) {
+                        child = right
+                    }
+                    if (escapeHeight[heapIdx[i]] >= escapeHeight[heapIdx[child]]) break
+                    heapSwap(i, child)
+                    i = child
+                }
+            }
+
+            fun heapInsertOrUpdate(idx: Int) {
+                val pos = heapPos[idx]
+                if (pos >= 0) {
+                    heapBubbleUp(pos)
+                    return
+                }
+
+                heapIdx[heapSize] = idx
+                heapPos[idx] = heapSize
+                heapSize++
+                heapBubbleUp(heapSize - 1)
+            }
+
+            fun heapPopMax(): Int {
+                val resIdx = heapIdx[0]
+                heapSize--
+                if (heapSize > 0) {
+                    val lastIdx = heapIdx[heapSize]
+                    heapIdx[0] = lastIdx
+                    heapPos[lastIdx] = 0
+                    heapBubbleDown(0)
+                }
+                heapPos[resIdx] = -1
+                return resIdx
+            }
+
+            // Initialize the heap with all boundary cells in the component.
+            for (i in 0 until componentSize) {
+                val idx = componentQueue[i]
+                val lx = idx % sizeX
+                val t = idx / sizeX
+                val ly = t % sizeY
+                val lz = t / sizeY
+                if (!isBoundary(lx, ly, lz)) continue
+                val worldY = baseWorldY + incX * lx + incY * ly + incZ * lz
+                escapeHeight[idx] = worldY
+                heapInsertOrUpdate(idx)
+            }
+
+            while (heapSize > 0) {
+                val idx = heapPopMax()
+                val value = escapeHeight[idx]
+
+                val lx = idx % sizeX
+                val t = idx / sizeX
+                val ly = t % sizeY
+                val lz = t / sizeY
+                val worldY = baseWorldY + incX * lx + incY * ly + incZ * lz
+
+                fun tryRelax(nIdx: Int, nWorldY: Double) {
+                    if (!open.get(nIdx)) return
+                    val candidate = minOf(value, nWorldY)
+                    if (candidate > escapeHeight[nIdx] + AIR_PRESSURE_Y_EPS) {
+                        escapeHeight[nIdx] = candidate
+                        heapInsertOrUpdate(nIdx)
+                    }
+                }
+
+                if (lx > 0) tryRelax(idx - 1, worldY - incX)
+                if (lx + 1 < sizeX) tryRelax(idx + 1, worldY + incX)
+                if (ly > 0) tryRelax(idx - strideY, worldY - incY)
+                if (ly + 1 < sizeY) tryRelax(idx + strideY, worldY + incY)
+                if (lz > 0) tryRelax(idx - strideZ, worldY - incZ)
+                if (lz + 1 < sizeZ) tryRelax(idx + strideZ, worldY + incZ)
+            }
+
+            // Flood-fill through submerged open cells, but only into cells that are at/below their escape height.
+            val waterQueue = heapIdx
+            head = 0
+            var waterTail = 0
+
+            fun tryEnqueueWater(idx: Int, worldY: Double) {
+                if (!open.get(idx) || out.get(idx)) return
+                if (!submerged.get(idx)) return
+                // Allow one-step rise above the escape height so the inlet block itself becomes wet (e.g., a bottom hole
+                // where the outside water cell is one step lower than the first interior cell).
+                if (worldY > escapeHeight[idx] + maxStepWorldY + AIR_PRESSURE_Y_EPS) return
+                out.set(idx)
+                waterQueue[waterTail++] = idx
+            }
+
+            // Seed all boundary water contact points for this open component.
+            for (i in 0 until componentSize) {
+                val idx = componentQueue[i]
+                val lx = idx % sizeX
+                val t = idx / sizeX
+                val ly = t % sizeY
+                val lz = t / sizeY
+                if (!isBoundary(lx, ly, lz)) continue
+                if (!submerged.get(idx)) continue
+                val worldY = baseWorldY + incX * lx + incY * ly + incZ * lz
+                tryEnqueueWater(idx, worldY)
+            }
+
+            while (head < waterTail) {
+                val idx = waterQueue[head++]
+
+                val lx = idx % sizeX
+                val t = idx / sizeX
+                val ly = t % sizeY
+                val lz = t / sizeY
+                val worldY = baseWorldY + incX * lx + incY * ly + incZ * lz
+
+                if (lx > 0) tryEnqueueWater(idx - 1, worldY - incX)
+                if (lx + 1 < sizeX) tryEnqueueWater(idx + 1, worldY + incX)
+                if (ly > 0) tryEnqueueWater(idx - strideY, worldY - incY)
+                if (ly + 1 < sizeY) tryEnqueueWater(idx + strideY, worldY + incY)
+                if (lz > 0) tryEnqueueWater(idx - strideZ, worldY - incZ)
+                if (lz + 1 < sizeZ) tryEnqueueWater(idx + strideZ, worldY + incZ)
+            }
         }
 
         return out
+    }
+
+    private fun computeWaterReachable(
+        level: Level,
+        state: ShipPocketState,
+        shipTransform: ShipTransform,
+    ): BitSet {
+        return computeWaterReachableWithPressure(
+            level,
+            state.minX,
+            state.minY,
+            state.minZ,
+            state.sizeX,
+            state.sizeY,
+            state.sizeZ,
+            state.open,
+            shipTransform,
+            state.waterReachable,
+        )
     }
 
     /**
@@ -773,66 +1053,18 @@ object ShipWaterPocketManager {
         shipTransform: ShipTransform,
         out: BitSet,
     ): BitSet {
-        out.clear()
-
-        val volume = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
-        if (volume <= 0 || volume > MAX_SIM_VOLUME.toLong()) return out
-        if (open.isEmpty) return out
-
-        val volumeInt = volume.toInt()
-
-        var queue = tmpFloodQueue.get()
-        if (queue.size < volumeInt) {
-            queue = IntArray(volumeInt)
-            tmpFloodQueue.set(queue)
-        }
-        var head = 0
-        var tail = 0
-
-        val worldPosTmp = Vector3d()
-        val shipPosTmp = Vector3d()
-        val shipBlockPos = BlockPos.MutableBlockPos()
-        val worldBlockPos = BlockPos.MutableBlockPos()
-
-        fun shipCellSubmerged(idx: Int): Boolean {
-            val lx = idx % sizeX
-            val t = idx / sizeX
-            val ly = t % sizeY
-            val lz = t / sizeY
-            shipBlockPos.set(minX + lx, minY + ly, minZ + lz)
-            return isShipCellSubmergedInWorldWater(level, shipTransform, shipBlockPos, shipPosTmp, worldPosTmp, worldBlockPos)
-        }
-
-        fun tryEnqueue(idx: Int) {
-            if (!open.get(idx) || out.get(idx)) return
-            if (!shipCellSubmerged(idx)) return
-            out.set(idx)
-            queue[tail++] = idx
-        }
-
-        // Seed from boundary open cells that are submerged in world water; then flood-fill through submerged open cells.
-        forEachBoundaryIndex(sizeX, sizeY, sizeZ) { idx -> tryEnqueue(idx) }
-
-        val strideY = sizeX
-        val strideZ = sizeX * sizeY
-
-        while (head < tail) {
-            val idx = queue[head++]
-
-            val lx = idx % sizeX
-            val t = idx / sizeX
-            val ly = t % sizeY
-            val lz = t / sizeY
-
-            if (lx > 0) tryEnqueue(idx - 1)
-            if (lx + 1 < sizeX) tryEnqueue(idx + 1)
-            if (ly > 0) tryEnqueue(idx - strideY)
-            if (ly + 1 < sizeY) tryEnqueue(idx + strideY)
-            if (lz > 0) tryEnqueue(idx - strideZ)
-            if (lz + 1 < sizeZ) tryEnqueue(idx + strideZ)
-        }
-
-        return out
+        return computeWaterReachableWithPressure(
+            level,
+            minX,
+            minY,
+            minZ,
+            sizeX,
+            sizeY,
+            sizeZ,
+            open,
+            shipTransform,
+            out,
+        )
     }
 
     private fun updateFlooding(level: ServerLevel, ship: LoadedShip, state: ShipPocketState, shipTransform: ShipTransform) {
