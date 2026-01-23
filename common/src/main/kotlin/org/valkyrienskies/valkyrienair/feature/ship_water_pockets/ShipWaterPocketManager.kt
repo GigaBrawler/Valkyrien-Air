@@ -42,6 +42,7 @@ object ShipWaterPocketManager {
     private const val MAX_SIM_VOLUME = 2_000_000
     private const val POCKET_BOUNDS_PADDING = 1
     private const val AIR_PRESSURE_Y_EPS = 1e-7
+    private const val WALL_HOLE_MIN_LATERAL_SOLIDS = 3
 
     @Volatile
     private var applyingInternalUpdates: Boolean = false
@@ -791,21 +792,64 @@ object ShipWaterPocketManager {
             idx = open.nextSetBit(idx + 1)
         }
 
-        // World-space Y is an affine function of ship-space x/y/z. Sample it once to get a fast linear map.
-        fun worldYAtShipPos(x: Double, y: Double, z: Double): Double {
-            shipPosTmp.set(x, y, z)
-            shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
-            return worldPosTmp.y
-        }
-
         val baseShipX = minX + 0.5
         val baseShipY = minY + 0.5
         val baseShipZ = minZ + 0.5
-        val baseWorldY = worldYAtShipPos(baseShipX, baseShipY, baseShipZ)
-        val incX = worldYAtShipPos(baseShipX + 1.0, baseShipY, baseShipZ) - baseWorldY
-        val incY = worldYAtShipPos(baseShipX, baseShipY + 1.0, baseShipZ) - baseWorldY
-        val incZ = worldYAtShipPos(baseShipX, baseShipY, baseShipZ + 1.0) - baseWorldY
+
+        shipPosTmp.set(baseShipX, baseShipY, baseShipZ)
+        shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+        val baseWorldX = worldPosTmp.x
+        val baseWorldY = worldPosTmp.y
+        val baseWorldZ = worldPosTmp.z
+
+        // World-space Y is an affine function of ship-space x/y/z. Sample it once to get a fast linear map.
+        // Also compute axis step vectors so "wall inlet" classification is robust even if the transform isn't unit scale.
+        val dX = Vector3d()
+        val dY = Vector3d()
+        val dZ = Vector3d()
+
+        shipPosTmp.set(baseShipX + 1.0, baseShipY, baseShipZ)
+        shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+        dX.set(worldPosTmp.x - baseWorldX, worldPosTmp.y - baseWorldY, worldPosTmp.z - baseWorldZ)
+
+        shipPosTmp.set(baseShipX, baseShipY + 1.0, baseShipZ)
+        shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+        dY.set(worldPosTmp.x - baseWorldX, worldPosTmp.y - baseWorldY, worldPosTmp.z - baseWorldZ)
+
+        shipPosTmp.set(baseShipX, baseShipY, baseShipZ + 1.0)
+        shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+        dZ.set(worldPosTmp.x - baseWorldX, worldPosTmp.y - baseWorldY, worldPosTmp.z - baseWorldZ)
+
+        val incX = dX.y
+        val incY = dY.y
+        val incZ = dZ.y
         val maxStepWorldY = maxOf(kotlin.math.abs(incX), kotlin.math.abs(incY), kotlin.math.abs(incZ))
+
+        // Determine which ship axis is most aligned with world up (treat that as the "vertical end" axis).
+        // The other four faces are treated as "walls" for the special-case flooding rule:
+        // submerged wall holes always flood regardless of trapped air.
+        //
+        // Use transformed face normals (cross products) so this remains correct even if the transform isn't unit scale.
+        val nX = Vector3d(dY).cross(dZ)
+        val nY = Vector3d(dZ).cross(dX)
+        val nZ = Vector3d(dX).cross(dY)
+
+        fun verticalFrac(normal: Vector3d): Double {
+            val len = normal.length()
+            if (len <= 1e-12) return 0.0
+            return kotlin.math.abs(normal.y) / len
+        }
+
+        val vX = verticalFrac(nX)
+        val vY = verticalFrac(nY)
+        val vZ = verticalFrac(nZ)
+
+        val verticalAxis =
+            if (vY >= vX && vY >= vZ) 1 else if (vX >= vZ) 0 else 2 // 0=X, 1=Y, 2=Z
+
+        val isWallFaceX = verticalAxis != 0
+        val isWallFaceY = verticalAxis != 1
+        val isWallFaceZ = verticalAxis != 2
 
         val strideY = sizeX
         val strideZ = sizeX * sizeY
@@ -850,6 +894,161 @@ object ShipWaterPocketManager {
 
             val componentSize = tail
             if (componentSize <= 0) return@forEachBoundaryIndex
+
+            // If outside water can enter this component through a submerged wall hole, treat it as "unpressurized":
+            // submerged wall holes always flood regardless of trapped air.
+            //
+            // IMPORTANT: We must detect actual hull openings, not just "this component is big enough that boundary water
+            // can move inward". Use the padded AABB (POCKET_BOUNDS_PADDING=1): a true hull hole shows up as an open cell
+            // 1 block in from the sim bounds, with submerged open space on the outside neighbor and solid blocks around
+            // the opening (lateral to the hole axis).
+            var hasSubmergedWallHole = false
+
+            fun lateralSolidCountForX(idx: Int, ly: Int, lz: Int): Int {
+                var solids = 0
+                if (ly > 0 && !open.get(idx - strideY)) solids++
+                if (ly + 1 < sizeY && !open.get(idx + strideY)) solids++
+                if (lz > 0 && !open.get(idx - strideZ)) solids++
+                if (lz + 1 < sizeZ && !open.get(idx + strideZ)) solids++
+                return solids
+            }
+
+            fun lateralSolidCountForY(idx: Int, lx: Int, lz: Int): Int {
+                var solids = 0
+                if (lx > 0 && !open.get(idx - 1)) solids++
+                if (lx + 1 < sizeX && !open.get(idx + 1)) solids++
+                if (lz > 0 && !open.get(idx - strideZ)) solids++
+                if (lz + 1 < sizeZ && !open.get(idx + strideZ)) solids++
+                return solids
+            }
+
+            fun lateralSolidCountForZ(idx: Int, lx: Int, ly: Int): Int {
+                var solids = 0
+                if (lx > 0 && !open.get(idx - 1)) solids++
+                if (lx + 1 < sizeX && !open.get(idx + 1)) solids++
+                if (ly > 0 && !open.get(idx - strideY)) solids++
+                if (ly + 1 < sizeY && !open.get(idx + strideY)) solids++
+                return solids
+            }
+
+            for (i in 0 until componentSize) {
+                val idx = componentQueue[i]
+                if (!submerged.get(idx)) continue
+                val lx = idx % sizeX
+                val t = idx / sizeX
+                val ly = t % sizeY
+                val lz = t / sizeY
+                if (isBoundary(lx, ly, lz)) continue
+
+                if (isWallFaceX && sizeX > 2) {
+                    if (lx == 1) {
+                        val outIdx = idx - 1
+                        val inIdx = idx + 1
+                        if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
+                            if (lateralSolidCountForX(idx, ly, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
+                                hasSubmergedWallHole = true
+                                break
+                            }
+                        }
+                    } else if (lx == sizeX - 2) {
+                        val outIdx = idx + 1
+                        val inIdx = idx - 1
+                        if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
+                            if (lateralSolidCountForX(idx, ly, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
+                                hasSubmergedWallHole = true
+                                break
+                            }
+                        }
+                    }
+                }
+
+                if (isWallFaceY && sizeY > 2) {
+                    if (ly == 1) {
+                        val outIdx = idx - strideY
+                        val inIdx = idx + strideY
+                        if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
+                            if (lateralSolidCountForY(idx, lx, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
+                                hasSubmergedWallHole = true
+                                break
+                            }
+                        }
+                    } else if (ly == sizeY - 2) {
+                        val outIdx = idx + strideY
+                        val inIdx = idx - strideY
+                        if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
+                            if (lateralSolidCountForY(idx, lx, lz) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
+                                hasSubmergedWallHole = true
+                                break
+                            }
+                        }
+                    }
+                }
+
+                if (isWallFaceZ && sizeZ > 2) {
+                    if (lz == 1) {
+                        val outIdx = idx - strideZ
+                        val inIdx = idx + strideZ
+                        if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
+                            if (lateralSolidCountForZ(idx, lx, ly) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
+                                hasSubmergedWallHole = true
+                                break
+                            }
+                        }
+                    } else if (lz == sizeZ - 2) {
+                        val outIdx = idx + strideZ
+                        val inIdx = idx - strideZ
+                        if (open.get(outIdx) && submerged.get(outIdx) && open.get(inIdx)) {
+                            if (lateralSolidCountForZ(idx, lx, ly) >= WALL_HOLE_MIN_LATERAL_SOLIDS) {
+                                hasSubmergedWallHole = true
+                                break
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (hasSubmergedWallHole) {
+                // Vanilla-style flood fill through submerged open cells (no air pressure restriction).
+                val waterQueue = heapIdx
+                head = 0
+                var waterTail = 0
+
+                fun tryEnqueueWater(idx: Int) {
+                    if (!open.get(idx) || out.get(idx)) return
+                    if (!submerged.get(idx)) return
+                    out.set(idx)
+                    waterQueue[waterTail++] = idx
+                }
+
+                for (i in 0 until componentSize) {
+                    val idx = componentQueue[i]
+                    val lx = idx % sizeX
+                    val t = idx / sizeX
+                    val ly = t % sizeY
+                    val lz = t / sizeY
+                    if (!isBoundary(lx, ly, lz)) continue
+                    if (!submerged.get(idx)) continue
+                    tryEnqueueWater(idx)
+                }
+
+                while (head < waterTail) {
+                    val idx = waterQueue[head++]
+
+                    val lx = idx % sizeX
+                    val t = idx / sizeX
+                    val ly = t % sizeY
+                    val lz = t / sizeY
+
+                    if (lx > 0) tryEnqueueWater(idx - 1)
+                    if (lx + 1 < sizeX) tryEnqueueWater(idx + 1)
+                    if (ly > 0) tryEnqueueWater(idx - strideY)
+                    if (ly + 1 < sizeY) tryEnqueueWater(idx + strideY)
+                    if (lz > 0) tryEnqueueWater(idx - strideZ)
+                    if (lz + 1 < sizeZ) tryEnqueueWater(idx + strideZ)
+                }
+
+                return@forEachBoundaryIndex
+            }
 
             // Compute, for each cell in the component, the highest world-space Y-level L such that there exists a path
             // from that cell to the bounds that never goes below L (a maximin "escape height").
