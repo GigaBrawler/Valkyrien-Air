@@ -1,12 +1,15 @@
 package org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets
 
 import com.mojang.blaze3d.systems.RenderSystem
+import com.mojang.blaze3d.vertex.DefaultVertexFormat
 import com.mojang.blaze3d.vertex.Tesselator
+import com.mojang.blaze3d.vertex.VertexFormat
 import com.mojang.blaze3d.vertex.VertexSorting
 import net.minecraft.client.Minecraft
 import net.minecraft.client.renderer.BiomeColors
 import net.minecraft.client.renderer.LevelRenderer
 import net.minecraft.client.renderer.MultiBufferSource
+import net.minecraft.client.renderer.RenderStateShard
 import net.minecraft.client.renderer.RenderType
 import net.minecraft.client.renderer.texture.OverlayTexture
 import net.minecraft.client.renderer.texture.TextureAtlasSprite
@@ -24,6 +27,7 @@ import org.valkyrienskies.mod.common.hooks.VSGameEvents
 import org.valkyrienskies.valkyrienair.config.ValkyrienAirConfig
 import org.valkyrienskies.valkyrienair.feature.ship_water_pockets.ShipWaterPocketManager
 import kotlin.math.abs
+import kotlin.math.min
 
 /**
  * Renders a "fake" water surface for pressurized ship openings.
@@ -34,7 +38,7 @@ import kotlin.math.abs
 object ShipWaterPocketFakeWaterSurfaceRenderer {
 
     private val WATER_STILL_SPRITE_ID = ResourceLocation("minecraft", "block/water_still")
-    private val FAKE_SURFACE_RENDER_TYPE = RenderType.translucent()
+    private val FAKE_SURFACE_RENDER_TYPE = createFakeSurfaceRenderType()
     private const val FAKE_SURFACE_HEIGHT = 0.875
     private const val FAKE_SURFACE_BASE_SHIFT = FAKE_SURFACE_HEIGHT - 1.0
     private const val FREE_SURFACE_MAX_SCAN_DOWN = 64
@@ -613,7 +617,9 @@ object ShipWaterPocketFakeWaterSurfaceRenderer {
             if (above.isEmpty || !above.`is`(Fluids.WATER)) {
                 tmpWorldBlockPos2.set(baseX, topY, baseZ)
                 val height = topFs!!.getHeight(level, tmpWorldBlockPos2).toDouble()
-                return topY.toDouble() + height
+                // Vanilla's rendered water surface for a full source block isn't perfectly flush with the block top.
+                // Clamp to the fake surface height so we blend at the same visible level.
+                return topY.toDouble() + min(height, FAKE_SURFACE_HEIGHT)
             }
             topY = nextY
             topFs = above
@@ -622,6 +628,25 @@ object ShipWaterPocketFakeWaterSurfaceRenderer {
 
         // Free surface is too far above (deep underwater). Don't treat it as "near surface" for blending.
         return null
+    }
+
+    private fun createFakeSurfaceRenderType(): RenderType {
+        return RenderType.create(
+            "valkyrienair_fake_water_surface",
+            DefaultVertexFormat.BLOCK,
+            VertexFormat.Mode.QUADS,
+            256,
+            true,
+            true,
+            RenderType.CompositeState.builder()
+                .setShaderState(RenderStateShard.RENDERTYPE_TRANSLUCENT_SHADER)
+                .setTextureState(RenderStateShard.BLOCK_SHEET_MIPPED)
+                .setTransparencyState(RenderStateShard.TRANSLUCENT_TRANSPARENCY)
+                .setLightmapState(RenderStateShard.LIGHTMAP)
+                .setOverlayState(RenderStateShard.OVERLAY)
+                .setCullState(RenderStateShard.NO_CULL)
+                .createCompositeState(true),
+        )
     }
 
     private inline fun withFaceVerticesShipSpace(
