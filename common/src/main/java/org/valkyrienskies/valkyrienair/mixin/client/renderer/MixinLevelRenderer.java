@@ -17,7 +17,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.ShipWaterPocketExternalWaterCullRenderContext;
-import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.ShipWaterPocketUnderwaterViewOverlay;
+import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.ShipWaterPocketUnderwaterViewFog;
 
 // Some renderers can overwrite LevelRenderer's chunk-layer rendering, which makes INVOKE-based injections into that
 // method fragile. We track the active world translucent pass here and drive shader uniform updates from ShaderInstance#apply.
@@ -37,6 +37,7 @@ public abstract class MixinLevelRenderer {
         final CallbackInfo ci) {
         if (this.level == null) return;
         if (renderType != RenderType.translucent()) return;
+        ShipWaterPocketUnderwaterViewFog.captureOpaqueDepthIfNeeded(this.level);
         ShipWaterPocketExternalWaterCullRenderContext.beginWorldTranslucentChunkLayer(this.level, camX, camY, camZ);
     }
 
@@ -77,7 +78,7 @@ public abstract class MixinLevelRenderer {
         RenderSystem.setProjectionMatrix(projectionMatrix, VertexSorting.DISTANCE_TO_ORIGIN);
         RenderSystem.applyModelViewMatrix();
         try {
-            ShipWaterPocketUnderwaterViewOverlay.render(camPos.x, camPos.y, camPos.z);
+            ShipWaterPocketUnderwaterViewFog.renderAndComposite(this.level, camera, projectionMatrix, poseStack.last().pose());
         } finally {
             modelViewStack.popPose();
             RenderSystem.applyModelViewMatrix();

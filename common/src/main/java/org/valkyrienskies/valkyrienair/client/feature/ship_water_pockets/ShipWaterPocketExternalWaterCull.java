@@ -304,93 +304,15 @@ public final class ShipWaterPocketExternalWaterCull {
             SHADER.cullEnabled.upload();
         }
 
-        setShipUnderwaterViewEnabled(shader, true);
-        setShipPassCoordsAreShipSpace(shader, shipSpaceCoords);
-        setCameraInWater(shader, cameraInWater);
+        // Underwater-view tint for transparent ship blocks is disabled when the screen-space fog effect is active.
+        setShipUnderwaterViewEnabled(shader, false);
+        setShipPassCoordsAreShipSpace(shader, false);
+        setCameraInWater(shader, false);
+        shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
 
         final Vec3 cameraPos = new Vec3(cameraX, cameraY, cameraZ);
         updateCameraAndWaterUv(cameraPos);
-
-        LoadedShip ship = null;
-        for (final LoadedShip candidate : VSGameUtilsKt.getShipObjectWorld(level).getLoadedShips()) {
-            if (candidate.getId() == shipId) {
-                ship = candidate;
-                break;
-            }
-        }
-        if (ship == null) {
-            setShipUnderwaterViewEnabled(shader, false);
-            shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
-            return;
-        }
-
-        final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot =
-            ShipWaterPocketManager.getClientWaterReachableSnapshot(level, shipId);
-        if (snapshot == null) {
-            setShipUnderwaterViewEnabled(shader, false);
-            shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
-            return;
-        }
-
-        final ShipMasks masks = SHIP_MASKS.computeIfAbsent(shipId, ShipMasks::new);
-
-        final int minX = snapshot.getMinX();
-        final int minY = snapshot.getMinY();
-        final int minZ = snapshot.getMinZ();
-        final int sizeX = snapshot.getSizeX();
-        final int sizeY = snapshot.getSizeY();
-        final int sizeZ = snapshot.getSizeZ();
-        final long geometryRevision = snapshot.getGeometryRevision();
-
-        final boolean boundsChanged =
-            masks.minX != minX || masks.minY != minY || masks.minZ != minZ ||
-                masks.sizeX != sizeX || masks.sizeY != sizeY || masks.sizeZ != sizeZ;
-
-        if (boundsChanged || masks.geometryRevision != geometryRevision) {
-            rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
-        }
-
-        updateShipUnderwaterViewMask(level, masks, snapshot, level.getGameTime());
-        shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", masks.shipUnderwaterViewTexId);
-
-        // Fill slot 0 with the current ship and disable other slots.
-        disableShipSlot(1);
-        disableShipSlot(2);
-        disableShipSlot(3);
-
-        final AABBdc shipWorldAabbDc = getShipWorldAabb(ship).orElse(null);
-        if (shipWorldAabbDc != null) {
-            SHADER.shipAabbMin[0].set((float) shipWorldAabbDc.minX(), (float) shipWorldAabbDc.minY(), (float) shipWorldAabbDc.minZ(), 0.0f);
-            SHADER.shipAabbMax[0].set((float) shipWorldAabbDc.maxX(), (float) shipWorldAabbDc.maxY(), (float) shipWorldAabbDc.maxZ(), 0.0f);
-            SHADER.shipAabbMin[0].upload();
-            SHADER.shipAabbMax[0].upload();
-        }
-
-        SHADER.gridMin[0].set(0.0f, 0.0f, 0.0f, 0.0f);
-        SHADER.gridSize[0].set((float) sizeX, (float) sizeY, (float) sizeZ, 0.0f);
-        SHADER.gridMin[0].upload();
-        SHADER.gridSize[0].upload();
-
-        final ShipTransform shipTransform = getShipTransform(ship);
-        final Matrix4dc worldToShip = shipTransform.getWorldToShip();
-        final double biasedM30 = worldToShip.m30() - (double) minX;
-        final double biasedM31 = worldToShip.m31() - (double) minY;
-        final double biasedM32 = worldToShip.m32() - (double) minZ;
-
-        masks.worldToShip.set(
-            (float) worldToShip.m00(), (float) worldToShip.m01(), (float) worldToShip.m02(), (float) worldToShip.m03(),
-            (float) worldToShip.m10(), (float) worldToShip.m11(), (float) worldToShip.m12(), (float) worldToShip.m13(),
-            (float) worldToShip.m20(), (float) worldToShip.m21(), (float) worldToShip.m22(), (float) worldToShip.m23(),
-            (float) biasedM30, (float) biasedM31, (float) biasedM32, (float) worldToShip.m33()
-        );
-        SHADER.worldToShip[0].set(masks.worldToShip);
-        SHADER.worldToShip[0].upload();
-
-        final double camShipX = worldToShip.m00() * cameraX + worldToShip.m10() * cameraY + worldToShip.m20() * cameraZ + biasedM30;
-        final double camShipY = worldToShip.m01() * cameraX + worldToShip.m11() * cameraY + worldToShip.m21() * cameraZ + biasedM31;
-        final double camShipZ = worldToShip.m02() * cameraX + worldToShip.m12() * cameraY + worldToShip.m22() * cameraZ + biasedM32;
-        SHADER.cameraShipPos[0].set((float) camShipX, (float) camShipY, (float) camShipZ);
-        SHADER.cameraShipPos[0].upload();
+        // Nothing else is needed for ship rendering when underwater-view tint is disabled.
     }
 
     public static void setupForWorldTranslucentPassProgram(final int programId, final ClientLevel level,
@@ -481,13 +403,14 @@ public final class ShipWaterPocketExternalWaterCull {
         }
 
         if (handles.shipUnderwaterViewEnabledLoc >= 0) {
-            GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 1.0f);
+            // Underwater-view tint for transparent ship blocks is disabled when the screen-space fog effect is active.
+            GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 0.0f);
         }
         if (handles.shipPassCoordsAreShipSpaceLoc >= 0) {
-            GL20.glUniform1f(handles.shipPassCoordsAreShipSpaceLoc, shipSpaceCoords ? 1.0f : 0.0f);
+            GL20.glUniform1f(handles.shipPassCoordsAreShipSpaceLoc, 0.0f);
         }
         if (handles.cameraInWaterLoc >= 0) {
-            GL20.glUniform1f(handles.cameraInWaterLoc, cameraInWater ? 1.0f : 0.0f);
+            GL20.glUniform1f(handles.cameraInWaterLoc, 0.0f);
         }
 
         final Vec3 cameraPos = new Vec3(cameraX, cameraY, cameraZ);
@@ -495,107 +418,7 @@ public final class ShipWaterPocketExternalWaterCull {
             GL20.glUniform3f(handles.chunkWorldOriginLoc, (float) cameraPos.x, (float) cameraPos.y, (float) cameraPos.z);
         }
         updateCameraAndWaterUvProgram(handles, cameraPos);
-
-        LoadedShip ship = null;
-        for (final LoadedShip candidate : VSGameUtilsKt.getShipObjectWorld(level).getLoadedShips()) {
-            if (candidate.getId() == shipId) {
-                ship = candidate;
-                break;
-            }
-        }
-        if (ship == null) {
-            if (handles.shipUnderwaterViewEnabledLoc >= 0) {
-                GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 0.0f);
-            }
-            return;
-        }
-
-        final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot =
-            ShipWaterPocketManager.getClientWaterReachableSnapshot(level, shipId);
-        if (snapshot == null) {
-            if (handles.shipUnderwaterViewEnabledLoc >= 0) {
-                GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 0.0f);
-            }
-            return;
-        }
-
-        final ShipMasks masks = SHIP_MASKS.computeIfAbsent(shipId, ShipMasks::new);
-
-        final int minX = snapshot.getMinX();
-        final int minY = snapshot.getMinY();
-        final int minZ = snapshot.getMinZ();
-        final int sizeX = snapshot.getSizeX();
-        final int sizeY = snapshot.getSizeY();
-        final int sizeZ = snapshot.getSizeZ();
-        final long geometryRevision = snapshot.getGeometryRevision();
-
-        final boolean boundsChanged =
-            masks.minX != minX || masks.minY != minY || masks.minZ != minZ ||
-                masks.sizeX != sizeX || masks.sizeY != sizeY || masks.sizeZ != sizeZ;
-
-        if (boundsChanged || masks.geometryRevision != geometryRevision) {
-            rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
-        }
-
-        updateShipUnderwaterViewMask(level, masks, snapshot, level.getGameTime());
-
-        // Bind the underwater-view mask on a unit after the per-ship masks.
-        if (handles.shipUnderwaterViewMaskLoc >= 0 && masks.shipUnderwaterViewTexId != 0) {
-            final int underwaterUnit = BASE_MASK_TEX_UNIT + handles.maxMaskSlots * 2;
-            final int maxCombined = GL11.glGetInteger(GL20.GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS);
-            final int maxSafeUnits = Math.min(maxCombined, GLSTATEMANAGER_SAFE_TEXTURE_UNITS);
-            if (underwaterUnit >= 0 && underwaterUnit < maxSafeUnits) {
-                GL20.glUniform1i(handles.shipUnderwaterViewMaskLoc, underwaterUnit);
-                GlStateManager._activeTexture(GL13.GL_TEXTURE0 + underwaterUnit);
-                GlStateManager._bindTexture(masks.shipUnderwaterViewTexId);
-                GlStateManager._activeTexture(GL13.GL_TEXTURE0);
-            }
-        }
-
-        // Disable unused slots.
-        for (int slot = 1; slot < MAX_SHIPS; slot++) {
-            disableShipSlotProgram(handles, slot);
-        }
-
-        final AABBdc shipWorldAabbDc = getShipWorldAabb(ship).orElse(null);
-        if (shipWorldAabbDc != null) {
-            if (handles.shipAabbMinLoc[0] >= 0) {
-                GL20.glUniform4f(handles.shipAabbMinLoc[0], (float) shipWorldAabbDc.minX(), (float) shipWorldAabbDc.minY(),
-                    (float) shipWorldAabbDc.minZ(), 0.0f);
-            }
-            if (handles.shipAabbMaxLoc[0] >= 0) {
-                GL20.glUniform4f(handles.shipAabbMaxLoc[0], (float) shipWorldAabbDc.maxX(), (float) shipWorldAabbDc.maxY(),
-                    (float) shipWorldAabbDc.maxZ(), 0.0f);
-            }
-        }
-
-        if (handles.gridMinLoc[0] >= 0) {
-            GL20.glUniform4f(handles.gridMinLoc[0], 0.0f, 0.0f, 0.0f, 0.0f);
-        }
-        if (handles.gridSizeLoc[0] >= 0) {
-            GL20.glUniform4f(handles.gridSizeLoc[0], (float) sizeX, (float) sizeY, (float) sizeZ, 0.0f);
-        }
-
-        final ShipTransform shipTransform = getShipTransform(ship);
-        final Matrix4dc worldToShip = shipTransform.getWorldToShip();
-        final double biasedM30 = worldToShip.m30() - (double) minX;
-        final double biasedM31 = worldToShip.m31() - (double) minY;
-        final double biasedM32 = worldToShip.m32() - (double) minZ;
-
-        masks.worldToShip.set(
-            (float) worldToShip.m00(), (float) worldToShip.m01(), (float) worldToShip.m02(), (float) worldToShip.m03(),
-            (float) worldToShip.m10(), (float) worldToShip.m11(), (float) worldToShip.m12(), (float) worldToShip.m13(),
-            (float) worldToShip.m20(), (float) worldToShip.m21(), (float) worldToShip.m22(), (float) worldToShip.m23(),
-            (float) biasedM30, (float) biasedM31, (float) biasedM32, (float) worldToShip.m33()
-        );
-        uploadMatrixUniform(handles.worldToShipLoc[0], masks.worldToShip);
-
-        final double camShipX = worldToShip.m00() * cameraX + worldToShip.m10() * cameraY + worldToShip.m20() * cameraZ + biasedM30;
-        final double camShipY = worldToShip.m01() * cameraX + worldToShip.m11() * cameraY + worldToShip.m21() * cameraZ + biasedM31;
-        final double camShipZ = worldToShip.m02() * cameraX + worldToShip.m12() * cameraY + worldToShip.m22() * cameraZ + biasedM32;
-        if (handles.cameraShipPosLoc[0] >= 0) {
-            GL20.glUniform3f(handles.cameraShipPosLoc[0], (float) camShipX, (float) camShipY, (float) camShipZ);
-        }
+        // Nothing else is needed for ship rendering when underwater-view tint is disabled.
     }
 
     public static void disableProgram(final int programId) {

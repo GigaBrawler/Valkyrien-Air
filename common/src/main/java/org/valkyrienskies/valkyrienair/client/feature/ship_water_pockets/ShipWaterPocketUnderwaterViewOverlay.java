@@ -2,6 +2,8 @@ package org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets;
 
 import com.mojang.blaze3d.vertex.Tesselator;
 import com.mojang.blaze3d.vertex.VertexConsumer;
+import com.mojang.blaze3d.vertex.DefaultVertexFormat;
+import com.mojang.blaze3d.vertex.VertexFormat;
 import it.unimi.dsi.fastutil.longs.Long2DoubleOpenHashMap;
 import java.util.ArrayList;
 import java.util.BitSet;
@@ -14,6 +16,7 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.renderer.BiomeColors;
 import net.minecraft.client.renderer.ItemBlockRenderTypes;
 import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.RenderStateShard;
 import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.texture.OverlayTexture;
 import net.minecraft.core.BlockPos;
@@ -53,6 +56,39 @@ public final class ShipWaterPocketUnderwaterViewOverlay {
         new ResourceLocation("minecraft", "textures/misc/underwater.png");
 
     private static final RenderType OVERLAY_RENDER_TYPE = RenderType.entityTranslucent(UNDERWATER_OVERLAY_TEX);
+    private static final ResourceLocation WHITE_TEX = new ResourceLocation("minecraft", "textures/misc/white.png");
+
+    /**
+     * RenderType used for the offscreen entry-depth mask. It must:
+     * <ul>
+     *     <li>Write depth</li>
+     *     <li>Not bind/override any framebuffer (we bind our own FBO)</li>
+     *     <li>Disable culling so the mask works from any camera side</li>
+     * </ul>
+     */
+    private static final RenderStateShard.OutputStateShard CURRENT_TARGET =
+        new RenderStateShard.OutputStateShard("valkyrienair_current_target", () -> {}, () -> {});
+
+	    private static final RenderType DEPTH_MASK_RENDER_TYPE = RenderType.create(
+	        "valkyrienair_ship_underwater_entry_depth",
+	        DefaultVertexFormat.NEW_ENTITY,
+	        VertexFormat.Mode.QUADS,
+        256,
+        false,
+        false,
+	        RenderType.CompositeState.builder()
+	            // Use the solid entity shader to avoid any alpha-based discards that could prevent depth writes.
+	            .setShaderState(RenderStateShard.RENDERTYPE_ENTITY_SOLID_SHADER)
+	            .setTextureState(new RenderStateShard.TextureStateShard(WHITE_TEX, false, false))
+	            .setTransparencyState(RenderStateShard.NO_TRANSPARENCY)
+	            .setCullState(RenderStateShard.NO_CULL)
+	            .setLightmapState(RenderStateShard.NO_LIGHTMAP)
+            .setOverlayState(RenderStateShard.NO_OVERLAY)
+            .setDepthTestState(RenderStateShard.LEQUAL_DEPTH_TEST)
+            .setWriteMaskState(RenderStateShard.COLOR_DEPTH_WRITE)
+            .setOutputState(CURRENT_TARGET)
+            .createCompositeState(false)
+    );
 
     private static final int MAX_SHIPS = 8;
     private static final int MAX_WATER_SURFACE_CACHE = 8192;
@@ -99,11 +135,24 @@ public final class ShipWaterPocketUnderwaterViewOverlay {
     private static boolean loggedAnyFaces = false;
 
     public static void render(final double camX, final double camY, final double camZ) {
-        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) return;
+        renderInternal(camX, camY, camZ, OVERLAY_RENDER_TYPE, OVERLAY_ALPHA);
+    }
+
+    /**
+     * Render the same faces as {@link #render(double, double, double)}, but using a RenderType that writes depth.
+     * Used by the screen-space fog effect to build an entry-depth mask.
+     */
+    public static int renderDepthMask(final double camX, final double camY, final double camZ) {
+        return renderInternal(camX, camY, camZ, DEPTH_MASK_RENDER_TYPE, 1.0f);
+    }
+
+    private static int renderInternal(final double camX, final double camY, final double camZ, final RenderType renderType,
+        final float alpha) {
+        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) return 0;
 
         final Minecraft mc = Minecraft.getInstance();
         final var level = mc.level;
-        if (level == null || mc.gameRenderer == null) return;
+        if (level == null || mc.gameRenderer == null) return 0;
         if (lastSurfaceCacheLevel != level) {
             lastSurfaceCacheLevel = level;
             waterSurfaceCache.clear();
@@ -111,11 +160,11 @@ public final class ShipWaterPocketUnderwaterViewOverlay {
 
         final Camera camera = mc.gameRenderer.getMainCamera();
         final FogType fogType = camera.getFluidInCamera();
-        if (fogType == FogType.WATER) return;
+        if (fogType == FogType.WATER) return 0;
 
         final Vec3 cameraPos = new Vec3(camX, camY, camZ);
         final List<LoadedShip> ships = selectClosestShips(level, cameraPos, MAX_SHIPS);
-        if (ships.isEmpty()) return;
+        if (ships.isEmpty()) return 0;
 
         if (!loggedHookActive) {
             loggedHookActive = true;
@@ -126,7 +175,7 @@ public final class ShipWaterPocketUnderwaterViewOverlay {
 
         // Use a dedicated immediate buffer source so we don't interfere with the main world/entity batching order.
         final MultiBufferSource.BufferSource bufferSource = MultiBufferSource.immediate(Tesselator.getInstance().getBuilder());
-        final VertexConsumer vc = bufferSource.getBuffer(OVERLAY_RENDER_TYPE);
+        final VertexConsumer vc = bufferSource.getBuffer(renderType);
 
         int facesThisFrame = 0;
 
@@ -184,7 +233,7 @@ public final class ShipWaterPocketUnderwaterViewOverlay {
                 r,
                 g,
                 b,
-                OVERLAY_ALPHA,
+                alpha,
                 time
             );
         }
@@ -195,6 +244,7 @@ public final class ShipWaterPocketUnderwaterViewOverlay {
         }
 
         bufferSource.endBatch();
+        return facesThisFrame;
     }
 
     private static int computeWaterTintRgb(final net.minecraft.client.multiplayer.ClientLevel level, final ShipTransform shipTransform) {
