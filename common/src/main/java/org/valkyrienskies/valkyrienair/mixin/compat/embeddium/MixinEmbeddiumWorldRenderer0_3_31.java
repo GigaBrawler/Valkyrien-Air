@@ -11,6 +11,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.EmbeddiumChunkRenderContext;
 import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.ShipWaterPocketExternalWaterCullRenderContext;
+import org.valkyrienskies.valkyrienair.client.feature.ship_water_pockets.ShipWaterPocketUnderwaterViewOverlay;
 
 @Pseudo
 @Mixin(targets = "org.embeddedt.embeddium.impl.render.EmbeddiumWorldRenderer", remap = false)

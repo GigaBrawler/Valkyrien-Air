@@ -20,6 +20,8 @@ import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.renderer.ShaderInstance;
+import net.minecraft.client.renderer.ItemBlockRenderTypes;
+import net.minecraft.client.renderer.RenderType;
 import net.minecraft.client.renderer.texture.TextureAtlasSprite;
 import net.minecraft.core.BlockPos;
 import net.minecraft.resources.ResourceLocation;
@@ -100,6 +102,12 @@ public final class ShipWaterPocketExternalWaterCull {
         private int airTexHeight;
         private long lastAirUploadKey = Long.MIN_VALUE;
 
+        private int shipUnderwaterViewTexId;
+        private int shipUnderwaterViewTexHeight;
+        private long lastShipUnderwaterViewUploadTick = Long.MIN_VALUE;
+
+        private BitSet translucentSolids;
+
         private final Matrix4f worldToShip = new Matrix4f();
 
         private int[] occData;
@@ -107,6 +115,9 @@ public final class ShipWaterPocketExternalWaterCull {
 
         private int[] airData;
         private IntBuffer airBuffer;
+
+        private int[] shipUnderwaterViewData;
+        private IntBuffer shipUnderwaterViewBuffer;
 
         private ShipMasks(final long shipId) {
             this.shipId = shipId;
@@ -120,6 +131,10 @@ public final class ShipWaterPocketExternalWaterCull {
             if (airTexId != 0) {
                 TextureUtil.releaseTextureId(airTexId);
                 airTexId = 0;
+            }
+            if (shipUnderwaterViewTexId != 0) {
+                TextureUtil.releaseTextureId(shipUnderwaterViewTexId);
+                shipUnderwaterViewTexId = 0;
             }
         }
     }
@@ -142,6 +157,10 @@ public final class ShipWaterPocketExternalWaterCull {
         private int waterOverlayUvLoc = -1;
         private int shipWaterTintEnabledLoc = -1;
         private int shipWaterTintLoc = -1;
+        private int shipUnderwaterViewEnabledLoc = -1;
+        private int shipPassCoordsAreShipSpaceLoc = -1;
+        private int cameraInWaterLoc = -1;
+        private int shipUnderwaterViewMaskLoc = -1;
         private int chunkWorldOriginLoc = -1;
 
         private int maxMaskSlots = MAX_SHIPS;
@@ -177,6 +196,9 @@ public final class ShipWaterPocketExternalWaterCull {
         private Uniform waterOverlayUv;
         private Uniform shipWaterTintEnabled;
         private Uniform shipWaterTint;
+        private Uniform shipUnderwaterViewEnabled;
+        private Uniform shipPassCoordsAreShipSpace;
+        private Uniform cameraInWater;
 
         private final Uniform[] shipAabbMin = new Uniform[MAX_SHIPS];
         private final Uniform[] shipAabbMax = new Uniform[MAX_SHIPS];
@@ -244,12 +266,131 @@ public final class ShipWaterPocketExternalWaterCull {
         everEnabled = true;
 
         setShipPass(shader, false);
+        setShipUnderwaterViewEnabled(shader, false);
+        setShipPassCoordsAreShipSpace(shader, false);
+        setCameraInWater(shader, false);
+        shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
 
         final Vec3 cameraPos = new Vec3(cameraX, cameraY, cameraZ);
         updateCameraAndWaterUv(cameraPos);
 
         final List<LoadedShip> ships = selectClosestShips(level, cameraPos, MAX_SHIPS);
         updateShipUniformsAndMasks(level, ships, cameraX, cameraY, cameraZ);
+    }
+
+    public static void setupForShipTranslucentPass(final ShaderInstance shader, final ClientLevel level,
+        final double cameraX, final double cameraY, final double cameraZ, final long shipId, final boolean shipSpaceCoords,
+        final boolean cameraInWater) {
+        if (level == null || shipId == 0L) return;
+        RenderSystem.assertOnRenderThread();
+
+        if (lastLevel != level) {
+            clear();
+            lastLevel = level;
+        }
+
+        bindShaderHandles(shader);
+        if (!SHADER.supported) return;
+
+        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) {
+            setShipUnderwaterViewEnabled(shader, false);
+            shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
+            return;
+        }
+
+        // We don't need world-water surface culling while rendering the ship itself.
+        if (SHADER.cullEnabled != null) {
+            SHADER.cullEnabled.set(0.0f);
+            SHADER.cullEnabled.upload();
+        }
+
+        setShipUnderwaterViewEnabled(shader, true);
+        setShipPassCoordsAreShipSpace(shader, shipSpaceCoords);
+        setCameraInWater(shader, cameraInWater);
+
+        final Vec3 cameraPos = new Vec3(cameraX, cameraY, cameraZ);
+        updateCameraAndWaterUv(cameraPos);
+
+        LoadedShip ship = null;
+        for (final LoadedShip candidate : VSGameUtilsKt.getShipObjectWorld(level).getLoadedShips()) {
+            if (candidate.getId() == shipId) {
+                ship = candidate;
+                break;
+            }
+        }
+        if (ship == null) {
+            setShipUnderwaterViewEnabled(shader, false);
+            shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
+            return;
+        }
+
+        final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot =
+            ShipWaterPocketManager.getClientWaterReachableSnapshot(level, shipId);
+        if (snapshot == null) {
+            setShipUnderwaterViewEnabled(shader, false);
+            shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
+            return;
+        }
+
+        final ShipMasks masks = SHIP_MASKS.computeIfAbsent(shipId, ShipMasks::new);
+
+        final int minX = snapshot.getMinX();
+        final int minY = snapshot.getMinY();
+        final int minZ = snapshot.getMinZ();
+        final int sizeX = snapshot.getSizeX();
+        final int sizeY = snapshot.getSizeY();
+        final int sizeZ = snapshot.getSizeZ();
+        final long geometryRevision = snapshot.getGeometryRevision();
+
+        final boolean boundsChanged =
+            masks.minX != minX || masks.minY != minY || masks.minZ != minZ ||
+                masks.sizeX != sizeX || masks.sizeY != sizeY || masks.sizeZ != sizeZ;
+
+        if (boundsChanged || masks.geometryRevision != geometryRevision) {
+            rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
+        }
+
+        updateShipUnderwaterViewMask(level, masks, snapshot, level.getGameTime());
+        shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", masks.shipUnderwaterViewTexId);
+
+        // Fill slot 0 with the current ship and disable other slots.
+        disableShipSlot(1);
+        disableShipSlot(2);
+        disableShipSlot(3);
+
+        final AABBdc shipWorldAabbDc = getShipWorldAabb(ship).orElse(null);
+        if (shipWorldAabbDc != null) {
+            SHADER.shipAabbMin[0].set((float) shipWorldAabbDc.minX(), (float) shipWorldAabbDc.minY(), (float) shipWorldAabbDc.minZ(), 0.0f);
+            SHADER.shipAabbMax[0].set((float) shipWorldAabbDc.maxX(), (float) shipWorldAabbDc.maxY(), (float) shipWorldAabbDc.maxZ(), 0.0f);
+            SHADER.shipAabbMin[0].upload();
+            SHADER.shipAabbMax[0].upload();
+        }
+
+        SHADER.gridMin[0].set(0.0f, 0.0f, 0.0f, 0.0f);
+        SHADER.gridSize[0].set((float) sizeX, (float) sizeY, (float) sizeZ, 0.0f);
+        SHADER.gridMin[0].upload();
+        SHADER.gridSize[0].upload();
+
+        final ShipTransform shipTransform = getShipTransform(ship);
+        final Matrix4dc worldToShip = shipTransform.getWorldToShip();
+        final double biasedM30 = worldToShip.m30() - (double) minX;
+        final double biasedM31 = worldToShip.m31() - (double) minY;
+        final double biasedM32 = worldToShip.m32() - (double) minZ;
+
+        masks.worldToShip.set(
+            (float) worldToShip.m00(), (float) worldToShip.m01(), (float) worldToShip.m02(), (float) worldToShip.m03(),
+            (float) worldToShip.m10(), (float) worldToShip.m11(), (float) worldToShip.m12(), (float) worldToShip.m13(),
+            (float) worldToShip.m20(), (float) worldToShip.m21(), (float) worldToShip.m22(), (float) worldToShip.m23(),
+            (float) biasedM30, (float) biasedM31, (float) biasedM32, (float) worldToShip.m33()
+        );
+        SHADER.worldToShip[0].set(masks.worldToShip);
+        SHADER.worldToShip[0].upload();
+
+        final double camShipX = worldToShip.m00() * cameraX + worldToShip.m10() * cameraY + worldToShip.m20() * cameraZ + biasedM30;
+        final double camShipY = worldToShip.m01() * cameraX + worldToShip.m11() * cameraY + worldToShip.m21() * cameraZ + biasedM31;
+        final double camShipZ = worldToShip.m02() * cameraX + worldToShip.m12() * cameraY + worldToShip.m22() * cameraZ + biasedM32;
+        SHADER.cameraShipPos[0].set((float) camShipX, (float) camShipY, (float) camShipZ);
+        SHADER.cameraShipPos[0].upload();
     }
 
     public static void setupForWorldTranslucentPassProgram(final int programId, final ClientLevel level,
@@ -293,6 +434,15 @@ public final class ShipWaterPocketExternalWaterCull {
         if (handles.isShipPassLoc >= 0) {
             GL20.glUniform1f(handles.isShipPassLoc, 0.0f);
         }
+        if (handles.shipUnderwaterViewEnabledLoc >= 0) {
+            GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 0.0f);
+        }
+        if (handles.shipPassCoordsAreShipSpaceLoc >= 0) {
+            GL20.glUniform1f(handles.shipPassCoordsAreShipSpaceLoc, 0.0f);
+        }
+        if (handles.cameraInWaterLoc >= 0) {
+            GL20.glUniform1f(handles.cameraInWaterLoc, 0.0f);
+        }
 
         final Vec3 cameraPos = new Vec3(cameraX, cameraY, cameraZ);
         if (handles.chunkWorldOriginLoc >= 0) {
@@ -302,6 +452,150 @@ public final class ShipWaterPocketExternalWaterCull {
 
         final List<LoadedShip> ships = selectClosestShips(level, cameraPos, MAX_SHIPS);
         updateShipUniformsAndMasksProgram(handles, level, ships, cameraX, cameraY, cameraZ);
+    }
+
+    public static void setupForShipTranslucentPassProgram(final int programId, final ClientLevel level,
+        final double cameraX, final double cameraY, final double cameraZ, final long shipId, final boolean shipSpaceCoords,
+        final boolean cameraInWater) {
+        if (programId == 0 || level == null || shipId == 0L) return;
+        RenderSystem.assertOnRenderThread();
+
+        if (lastLevel != level) {
+            clear();
+            lastLevel = level;
+        }
+
+        final ProgramHandles handles = bindProgramHandles(programId);
+        if (handles == null || !handles.supported) return;
+
+        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) {
+            disableProgram(programId);
+            return;
+        }
+
+        if (handles.cullEnabledLoc >= 0) {
+            GL20.glUniform1f(handles.cullEnabledLoc, 0.0f);
+        }
+        if (handles.isShipPassLoc >= 0) {
+            GL20.glUniform1f(handles.isShipPassLoc, 1.0f);
+        }
+
+        if (handles.shipUnderwaterViewEnabledLoc >= 0) {
+            GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 1.0f);
+        }
+        if (handles.shipPassCoordsAreShipSpaceLoc >= 0) {
+            GL20.glUniform1f(handles.shipPassCoordsAreShipSpaceLoc, shipSpaceCoords ? 1.0f : 0.0f);
+        }
+        if (handles.cameraInWaterLoc >= 0) {
+            GL20.glUniform1f(handles.cameraInWaterLoc, cameraInWater ? 1.0f : 0.0f);
+        }
+
+        final Vec3 cameraPos = new Vec3(cameraX, cameraY, cameraZ);
+        if (handles.chunkWorldOriginLoc >= 0) {
+            GL20.glUniform3f(handles.chunkWorldOriginLoc, (float) cameraPos.x, (float) cameraPos.y, (float) cameraPos.z);
+        }
+        updateCameraAndWaterUvProgram(handles, cameraPos);
+
+        LoadedShip ship = null;
+        for (final LoadedShip candidate : VSGameUtilsKt.getShipObjectWorld(level).getLoadedShips()) {
+            if (candidate.getId() == shipId) {
+                ship = candidate;
+                break;
+            }
+        }
+        if (ship == null) {
+            if (handles.shipUnderwaterViewEnabledLoc >= 0) {
+                GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 0.0f);
+            }
+            return;
+        }
+
+        final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot =
+            ShipWaterPocketManager.getClientWaterReachableSnapshot(level, shipId);
+        if (snapshot == null) {
+            if (handles.shipUnderwaterViewEnabledLoc >= 0) {
+                GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 0.0f);
+            }
+            return;
+        }
+
+        final ShipMasks masks = SHIP_MASKS.computeIfAbsent(shipId, ShipMasks::new);
+
+        final int minX = snapshot.getMinX();
+        final int minY = snapshot.getMinY();
+        final int minZ = snapshot.getMinZ();
+        final int sizeX = snapshot.getSizeX();
+        final int sizeY = snapshot.getSizeY();
+        final int sizeZ = snapshot.getSizeZ();
+        final long geometryRevision = snapshot.getGeometryRevision();
+
+        final boolean boundsChanged =
+            masks.minX != minX || masks.minY != minY || masks.minZ != minZ ||
+                masks.sizeX != sizeX || masks.sizeY != sizeY || masks.sizeZ != sizeZ;
+
+        if (boundsChanged || masks.geometryRevision != geometryRevision) {
+            rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
+        }
+
+        updateShipUnderwaterViewMask(level, masks, snapshot, level.getGameTime());
+
+        // Bind the underwater-view mask on a unit after the per-ship masks.
+        if (handles.shipUnderwaterViewMaskLoc >= 0 && masks.shipUnderwaterViewTexId != 0) {
+            final int underwaterUnit = BASE_MASK_TEX_UNIT + handles.maxMaskSlots * 2;
+            final int maxCombined = GL11.glGetInteger(GL20.GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS);
+            final int maxSafeUnits = Math.min(maxCombined, GLSTATEMANAGER_SAFE_TEXTURE_UNITS);
+            if (underwaterUnit >= 0 && underwaterUnit < maxSafeUnits) {
+                GL20.glUniform1i(handles.shipUnderwaterViewMaskLoc, underwaterUnit);
+                GlStateManager._activeTexture(GL13.GL_TEXTURE0 + underwaterUnit);
+                GlStateManager._bindTexture(masks.shipUnderwaterViewTexId);
+                GlStateManager._activeTexture(GL13.GL_TEXTURE0);
+            }
+        }
+
+        // Disable unused slots.
+        for (int slot = 1; slot < MAX_SHIPS; slot++) {
+            disableShipSlotProgram(handles, slot);
+        }
+
+        final AABBdc shipWorldAabbDc = getShipWorldAabb(ship).orElse(null);
+        if (shipWorldAabbDc != null) {
+            if (handles.shipAabbMinLoc[0] >= 0) {
+                GL20.glUniform4f(handles.shipAabbMinLoc[0], (float) shipWorldAabbDc.minX(), (float) shipWorldAabbDc.minY(),
+                    (float) shipWorldAabbDc.minZ(), 0.0f);
+            }
+            if (handles.shipAabbMaxLoc[0] >= 0) {
+                GL20.glUniform4f(handles.shipAabbMaxLoc[0], (float) shipWorldAabbDc.maxX(), (float) shipWorldAabbDc.maxY(),
+                    (float) shipWorldAabbDc.maxZ(), 0.0f);
+            }
+        }
+
+        if (handles.gridMinLoc[0] >= 0) {
+            GL20.glUniform4f(handles.gridMinLoc[0], 0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        if (handles.gridSizeLoc[0] >= 0) {
+            GL20.glUniform4f(handles.gridSizeLoc[0], (float) sizeX, (float) sizeY, (float) sizeZ, 0.0f);
+        }
+
+        final ShipTransform shipTransform = getShipTransform(ship);
+        final Matrix4dc worldToShip = shipTransform.getWorldToShip();
+        final double biasedM30 = worldToShip.m30() - (double) minX;
+        final double biasedM31 = worldToShip.m31() - (double) minY;
+        final double biasedM32 = worldToShip.m32() - (double) minZ;
+
+        masks.worldToShip.set(
+            (float) worldToShip.m00(), (float) worldToShip.m01(), (float) worldToShip.m02(), (float) worldToShip.m03(),
+            (float) worldToShip.m10(), (float) worldToShip.m11(), (float) worldToShip.m12(), (float) worldToShip.m13(),
+            (float) worldToShip.m20(), (float) worldToShip.m21(), (float) worldToShip.m22(), (float) worldToShip.m23(),
+            (float) biasedM30, (float) biasedM31, (float) biasedM32, (float) worldToShip.m33()
+        );
+        uploadMatrixUniform(handles.worldToShipLoc[0], masks.worldToShip);
+
+        final double camShipX = worldToShip.m00() * cameraX + worldToShip.m10() * cameraY + worldToShip.m20() * cameraZ + biasedM30;
+        final double camShipY = worldToShip.m01() * cameraX + worldToShip.m11() * cameraY + worldToShip.m21() * cameraZ + biasedM31;
+        final double camShipZ = worldToShip.m02() * cameraX + worldToShip.m12() * cameraY + worldToShip.m22() * cameraZ + biasedM32;
+        if (handles.cameraShipPosLoc[0] >= 0) {
+            GL20.glUniform3f(handles.cameraShipPosLoc[0], (float) camShipX, (float) camShipY, (float) camShipZ);
+        }
     }
 
     public static void disableProgram(final int programId) {
@@ -322,6 +616,15 @@ public final class ShipWaterPocketExternalWaterCull {
         }
         if (handles.shipWaterTintLoc >= 0) {
             GL20.glUniform3f(handles.shipWaterTintLoc, 1.0f, 1.0f, 1.0f);
+        }
+        if (handles.shipUnderwaterViewEnabledLoc >= 0) {
+            GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, 0.0f);
+        }
+        if (handles.shipPassCoordsAreShipSpaceLoc >= 0) {
+            GL20.glUniform1f(handles.shipPassCoordsAreShipSpaceLoc, 0.0f);
+        }
+        if (handles.cameraInWaterLoc >= 0) {
+            GL20.glUniform1f(handles.cameraInWaterLoc, 0.0f);
         }
     }
 
@@ -360,6 +663,21 @@ public final class ShipWaterPocketExternalWaterCull {
             SHADER.shipWaterTint.set(1.0f, 1.0f, 1.0f);
             SHADER.shipWaterTint.upload();
         }
+
+        if (SHADER.shipUnderwaterViewEnabled != null) {
+            SHADER.shipUnderwaterViewEnabled.set(0.0f);
+            SHADER.shipUnderwaterViewEnabled.upload();
+        }
+        if (SHADER.shipPassCoordsAreShipSpace != null) {
+            SHADER.shipPassCoordsAreShipSpace.set(0.0f);
+            SHADER.shipPassCoordsAreShipSpace.upload();
+        }
+        if (SHADER.cameraInWater != null) {
+            SHADER.cameraInWater.set(0.0f);
+            SHADER.cameraInWater.upload();
+        }
+
+        shader.setSampler("ValkyrienAir_ShipUnderwaterViewMask", 0);
     }
 
     public static void setShipPass(final ShaderInstance shader, final boolean shipPass) {
@@ -399,6 +717,36 @@ public final class ShipWaterPocketExternalWaterCull {
         SHADER.shipWaterTint.upload();
     }
 
+    public static void setShipUnderwaterViewEnabled(final ShaderInstance shader, final boolean enabled) {
+        if (shader == null) return;
+        if (!SHIP_MASKS.isEmpty()) {
+            bindShaderHandles(shader);
+        }
+        if (!SHADER.supported || SHADER.shipUnderwaterViewEnabled == null) return;
+        SHADER.shipUnderwaterViewEnabled.set(enabled ? 1.0f : 0.0f);
+        SHADER.shipUnderwaterViewEnabled.upload();
+    }
+
+    public static void setShipPassCoordsAreShipSpace(final ShaderInstance shader, final boolean enabled) {
+        if (shader == null) return;
+        if (!SHIP_MASKS.isEmpty()) {
+            bindShaderHandles(shader);
+        }
+        if (!SHADER.supported || SHADER.shipPassCoordsAreShipSpace == null) return;
+        SHADER.shipPassCoordsAreShipSpace.set(enabled ? 1.0f : 0.0f);
+        SHADER.shipPassCoordsAreShipSpace.upload();
+    }
+
+    public static void setCameraInWater(final ShaderInstance shader, final boolean enabled) {
+        if (shader == null) return;
+        if (!SHIP_MASKS.isEmpty()) {
+            bindShaderHandles(shader);
+        }
+        if (!SHADER.supported || SHADER.cameraInWater == null) return;
+        SHADER.cameraInWater.set(enabled ? 1.0f : 0.0f);
+        SHADER.cameraInWater.upload();
+    }
+
     public static void setShipWaterTintEnabledProgram(final int programId, final boolean enabled) {
         if (programId == 0) return;
         RenderSystem.assertOnRenderThread();
@@ -419,6 +767,33 @@ public final class ShipWaterPocketExternalWaterCull {
         final float g = ((rgb >> 8) & 0xFF) / 255.0f;
         final float b = (rgb & 0xFF) / 255.0f;
         GL20.glUniform3f(handles.shipWaterTintLoc, r, g, b);
+    }
+
+    public static void setShipUnderwaterViewEnabledProgram(final int programId, final boolean enabled) {
+        if (programId == 0) return;
+        RenderSystem.assertOnRenderThread();
+
+        final ProgramHandles handles = bindProgramHandles(programId);
+        if (handles == null || handles.shipUnderwaterViewEnabledLoc < 0) return;
+        GL20.glUniform1f(handles.shipUnderwaterViewEnabledLoc, enabled ? 1.0f : 0.0f);
+    }
+
+    public static void setShipPassCoordsAreShipSpaceProgram(final int programId, final boolean enabled) {
+        if (programId == 0) return;
+        RenderSystem.assertOnRenderThread();
+
+        final ProgramHandles handles = bindProgramHandles(programId);
+        if (handles == null || handles.shipPassCoordsAreShipSpaceLoc < 0) return;
+        GL20.glUniform1f(handles.shipPassCoordsAreShipSpaceLoc, enabled ? 1.0f : 0.0f);
+    }
+
+    public static void setCameraInWaterProgram(final int programId, final boolean enabled) {
+        if (programId == 0) return;
+        RenderSystem.assertOnRenderThread();
+
+        final ProgramHandles handles = bindProgramHandles(programId);
+        if (handles == null || handles.cameraInWaterLoc < 0) return;
+        GL20.glUniform1f(handles.cameraInWaterLoc, enabled ? 1.0f : 0.0f);
     }
 
     private static void bindShaderHandles(final ShaderInstance shader) {
@@ -443,6 +818,9 @@ public final class ShipWaterPocketExternalWaterCull {
         SHADER.waterOverlayUv = shader.getUniform("ValkyrienAir_WaterOverlayUv");
         SHADER.shipWaterTintEnabled = shader.getUniform("ValkyrienAir_ShipWaterTintEnabled");
         SHADER.shipWaterTint = shader.getUniform("ValkyrienAir_ShipWaterTint");
+        SHADER.shipUnderwaterViewEnabled = shader.getUniform("ValkyrienAir_ShipUnderwaterViewEnabled");
+        SHADER.shipPassCoordsAreShipSpace = shader.getUniform("ValkyrienAir_ShipPassCoordsAreShipSpace");
+        SHADER.cameraInWater = shader.getUniform("ValkyrienAir_CameraInWater");
         if (SHADER.isShipPass == null || SHADER.cameraWorldPos == null || SHADER.waterStillUv == null ||
             SHADER.waterFlowUv == null || SHADER.waterOverlayUv == null) {
             return;
@@ -474,7 +852,9 @@ public final class ShipWaterPocketExternalWaterCull {
         final int maxCombined = GL11.glGetInteger(GL20.GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS);
         final int maxSafeUnits = Math.min(maxCombined, GLSTATEMANAGER_SAFE_TEXTURE_UNITS);
         final int availableUnits = maxSafeUnits - BASE_MASK_TEX_UNIT;
-        handles.maxMaskSlots = Math.max(0, Math.min(MAX_SHIPS, availableUnits / 2));
+        // Reserve one unit for the ship-underwater-view mask (used during ship rendering).
+        final int unitsForSlots = Math.max(0, availableUnits - 1);
+        handles.maxMaskSlots = Math.max(0, Math.min(MAX_SHIPS, unitsForSlots / 2));
 
         handles.regionOffsetLoc = GL20.glGetUniformLocation(programId, "u_RegionOffset");
         handles.blockTexLoc = GL20.glGetUniformLocation(programId, "u_BlockTex");
@@ -494,6 +874,10 @@ public final class ShipWaterPocketExternalWaterCull {
         handles.waterOverlayUvLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_WaterOverlayUv");
         handles.shipWaterTintEnabledLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipWaterTintEnabled");
         handles.shipWaterTintLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipWaterTint");
+        handles.shipUnderwaterViewEnabledLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipUnderwaterViewEnabled");
+        handles.shipPassCoordsAreShipSpaceLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipPassCoordsAreShipSpace");
+        handles.cameraInWaterLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_CameraInWater");
+        handles.shipUnderwaterViewMaskLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_ShipUnderwaterViewMask");
         handles.chunkWorldOriginLoc = GL20.glGetUniformLocation(programId, "ValkyrienAir_ChunkWorldOrigin");
 
 		        for (int i = 0; i < MAX_SHIPS; i++) {
@@ -929,6 +1313,12 @@ public final class ShipWaterPocketExternalWaterCull {
             java.util.Arrays.fill(masks.occData, 0);
         }
 
+        if (masks.translucentSolids == null || masks.translucentSolids.size() != volume) {
+            masks.translucentSolids = new BitSet(volume);
+        } else {
+            masks.translucentSolids.clear();
+        }
+
         final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 
         for (int lz = 0; lz < sizeZ; lz++) {
@@ -937,13 +1327,23 @@ public final class ShipWaterPocketExternalWaterCull {
                     pos.set(minX + lx, minY + ly, minZ + lz);
                     final BlockState state = level.getBlockState(pos);
 
+                    final int voxelIdx = lx + sizeX * (ly + sizeY * lz);
+
+                    // Precompute which solid voxels are rendered as translucent (e.g. glass). We'll use this list when
+                    // building the ship-underwater-view mask each tick.
+                    if (state.getFluidState().isEmpty()) {
+                        final RenderType chunkType = ItemBlockRenderTypes.getChunkRenderType(state);
+                        if (chunkType == RenderType.translucent()) {
+                            masks.translucentSolids.set(voxelIdx);
+                        }
+                    }
+
                     VoxelShape shape = state.getOcclusionShape(level, pos);
                     if (shape.isEmpty()) {
                         shape = state.getCollisionShape(level, pos);
                         if (shape.isEmpty()) continue;
                     }
 
-                    final int voxelIdx = lx + sizeX * (ly + sizeY * lz);
                     final int wordBase = voxelIdx * OCC_WORDS_PER_VOXEL;
 
                     shape.toAabbs().forEach(box -> {
@@ -1068,6 +1468,101 @@ public final class ShipWaterPocketExternalWaterCull {
         masks.airBuffer.flip();
 
         uploadIntTexture(masks.airTexId, MASK_TEX_WIDTH, masks.airTexHeight, masks.airBuffer);
+    }
+
+    private static boolean isOutsideSubmergedWater(final BitSet open, final BitSet interior, final BitSet waterReachable,
+        final int idx) {
+        return open.get(idx) && !interior.get(idx) && waterReachable.get(idx);
+    }
+
+    private static void updateShipUnderwaterViewMask(final ClientLevel level, final ShipMasks masks,
+        final ShipWaterPocketManager.ClientWaterReachableSnapshot snapshot, final long gameTime) {
+        final int sizeX = masks.sizeX;
+        final int sizeY = masks.sizeY;
+        final int sizeZ = masks.sizeZ;
+        final int volume = sizeX * sizeY * sizeZ;
+        if (volume <= 0) return;
+
+        final int wordCount = (volume + 31) >> 5;
+        final int height = Math.max(1, (wordCount + MASK_TEX_WIDTH - 1) / MASK_TEX_WIDTH);
+
+        if (masks.shipUnderwaterViewTexId != 0 && masks.shipUnderwaterViewTexHeight != height) {
+            TextureUtil.releaseTextureId(masks.shipUnderwaterViewTexId);
+            masks.shipUnderwaterViewTexId = 0;
+        }
+        masks.shipUnderwaterViewTexId = ensureIntTexture(masks.shipUnderwaterViewTexId, MASK_TEX_WIDTH, height);
+        masks.shipUnderwaterViewTexHeight = height;
+
+        if (masks.lastShipUnderwaterViewUploadTick == gameTime && masks.shipUnderwaterViewTexId != 0 &&
+            masks.shipUnderwaterViewTexHeight == height) {
+            return;
+        }
+        masks.lastShipUnderwaterViewUploadTick = gameTime;
+
+        final int capacity = MASK_TEX_WIDTH * height;
+        if (masks.shipUnderwaterViewData == null || masks.shipUnderwaterViewData.length != capacity) {
+            masks.shipUnderwaterViewData = new int[capacity];
+            masks.shipUnderwaterViewBuffer = BufferUtils.createIntBuffer(capacity);
+        } else {
+            java.util.Arrays.fill(masks.shipUnderwaterViewData, 0);
+        }
+
+        final BitSet translucentSolids = masks.translucentSolids;
+        if (translucentSolids == null || translucentSolids.isEmpty()) {
+            // Upload an empty mask so the shader doesn't read stale data.
+            masks.shipUnderwaterViewBuffer.clear();
+            masks.shipUnderwaterViewBuffer.put(masks.shipUnderwaterViewData);
+            masks.shipUnderwaterViewBuffer.flip();
+            uploadIntTexture(masks.shipUnderwaterViewTexId, MASK_TEX_WIDTH, masks.shipUnderwaterViewTexHeight, masks.shipUnderwaterViewBuffer);
+            return;
+        }
+
+        final BitSet open = snapshot.getOpen();
+        final BitSet interior = snapshot.getInterior();
+        final BitSet waterReachable = snapshot.getWaterReachable();
+
+        final int strideY = sizeX;
+        final int strideZ = sizeX * sizeY;
+
+        final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+
+        // Mark translucent ship blocks that have at least one face adjacent to *outside* submerged world water.
+        for (int idx = translucentSolids.nextSetBit(0); idx >= 0; idx = translucentSolids.nextSetBit(idx + 1)) {
+            // Safety: if a translucent solid was replaced by a non-translucent block without changing "open", don't
+            // keep tinting it forever.
+            final int lx = idx % sizeX;
+            final int t = idx / sizeX;
+            final int ly = t % sizeY;
+            final int lz = t / sizeY;
+            pos.set(masks.minX + lx, masks.minY + ly, masks.minZ + lz);
+            final BlockState state = level.getBlockState(pos);
+            if (!state.getFluidState().isEmpty() || ItemBlockRenderTypes.getChunkRenderType(state) != RenderType.translucent()) {
+                continue;
+            }
+
+            boolean touchesOutsideWater = false;
+
+            if (lx > 0 && isOutsideSubmergedWater(open, interior, waterReachable, idx - 1)) touchesOutsideWater = true;
+            if (!touchesOutsideWater && lx + 1 < sizeX && isOutsideSubmergedWater(open, interior, waterReachable, idx + 1)) touchesOutsideWater = true;
+            if (!touchesOutsideWater && ly > 0 && isOutsideSubmergedWater(open, interior, waterReachable, idx - strideY)) touchesOutsideWater = true;
+            if (!touchesOutsideWater && ly + 1 < sizeY && isOutsideSubmergedWater(open, interior, waterReachable, idx + strideY)) touchesOutsideWater = true;
+            if (!touchesOutsideWater && lz > 0 && isOutsideSubmergedWater(open, interior, waterReachable, idx - strideZ)) touchesOutsideWater = true;
+            if (!touchesOutsideWater && lz + 1 < sizeZ && isOutsideSubmergedWater(open, interior, waterReachable, idx + strideZ)) touchesOutsideWater = true;
+
+            if (!touchesOutsideWater) continue;
+
+            final int wordIdx = idx >> 5;
+            final int bit = idx & 31;
+            final int texIdx = (wordIdx & MASK_TEX_WIDTH_MASK) + (wordIdx >> MASK_TEX_WIDTH_SHIFT) * MASK_TEX_WIDTH;
+            if (texIdx < 0 || texIdx >= masks.shipUnderwaterViewData.length) continue;
+            masks.shipUnderwaterViewData[texIdx] |= (1 << bit);
+        }
+
+        masks.shipUnderwaterViewBuffer.clear();
+        masks.shipUnderwaterViewBuffer.put(masks.shipUnderwaterViewData);
+        masks.shipUnderwaterViewBuffer.flip();
+
+        uploadIntTexture(masks.shipUnderwaterViewTexId, MASK_TEX_WIDTH, masks.shipUnderwaterViewTexHeight, masks.shipUnderwaterViewBuffer);
     }
 
     private static int ensureIntTexture(final int existingId, final int width, final int height) {

@@ -27,6 +27,9 @@ uniform vec4 ValkyrienAir_WaterFlowUv;
 uniform vec4 ValkyrienAir_WaterOverlayUv;
 uniform float ValkyrienAir_ShipWaterTintEnabled;
 uniform vec3 ValkyrienAir_ShipWaterTint;
+uniform float ValkyrienAir_ShipUnderwaterViewEnabled;
+uniform float ValkyrienAir_ShipPassCoordsAreShipSpace;
+uniform float ValkyrienAir_CameraInWater;
 
 uniform vec4 ValkyrienAir_ShipAabbMin0;
 uniform vec4 ValkyrienAir_ShipAabbMax0;
@@ -64,6 +67,8 @@ uniform mat4 ValkyrienAir_WorldToShip3;
 uniform usampler2D ValkyrienAir_AirMask3;
 uniform usampler2D ValkyrienAir_OccMask3;
 
+uniform usampler2D ValkyrienAir_ShipUnderwaterViewMask;
+
 const int VA_MASK_TEX_WIDTH_SHIFT = 12;
 const int VA_MASK_TEX_WIDTH_MASK = (1 << VA_MASK_TEX_WIDTH_SHIFT) - 1;
 
@@ -89,6 +94,13 @@ bool va_testAir(usampler2D airMask, int voxelIdx) {
     int wordIndex = voxelIdx >> 5;
     int bit = voxelIdx & 31;
     uint word = va_fetchWord(airMask, wordIndex);
+    return ((word >> uint(bit)) & 1u) != 0u;
+}
+
+bool va_testShipUnderwaterView(usampler2D mask, int voxelIdx) {
+    int wordIndex = voxelIdx >> 5;
+    int bit = voxelIdx & 31;
+    uint word = va_fetchWord(mask, wordIndex);
     return ((word >> uint(bit)) & 1u) != 0u;
 }
 
@@ -211,6 +223,43 @@ void main() {
     vec4 color = texture(Sampler0, texCoord0) * vertexColor * ColorModulator;
     if (ValkyrienAir_ShipWaterTintEnabled > 0.5 && va_isWaterUv(texCoord0)) {
         color.rgb *= ValkyrienAir_ShipWaterTint;
+    }
+
+    // Ship underwater-view tint for transparent ship blocks (glass windows, etc.).
+    //
+    // When the camera is in air (e.g. inside an underwater air pocket), vanilla does not apply underwater fog to what
+    // you see through glass. Instead of changing the player's screen/camera overlay, we tint the ship's transparent
+    // blocks that are adjacent to outside world water to mimic that underwater diffusion.
+    if (ValkyrienAir_ShipUnderwaterViewEnabled > 0.5 && ValkyrienAir_CameraInWater < 0.5 && !va_isWaterUv(texCoord0)) {
+        if (ValkyrienAir_GridSize0.x > 0.0) {
+            vec3 shipPos;
+            if (ValkyrienAir_ShipPassCoordsAreShipSpace > 0.5) {
+                // Sodium/Embeddium ship rendering feeds ship-space camera-relative positions.
+                shipPos = valkyrienair_CamRelPos + ValkyrienAir_CameraShipPos0;
+            } else {
+                // Vanilla ship rendering uses world-space camera-relative positions.
+                shipPos = (ValkyrienAir_WorldToShip0 * vec4(valkyrienair_CamRelPos, 0.0)).xyz + ValkyrienAir_CameraShipPos0;
+            }
+
+            vec3 localPos = shipPos - ValkyrienAir_GridMin0.xyz;
+            vec3 size = ValkyrienAir_GridSize0.xyz;
+            if (localPos.x >= 0.0 && localPos.y >= 0.0 && localPos.z >= 0.0 &&
+                localPos.x < size.x && localPos.y < size.y && localPos.z < size.z) {
+
+                ivec3 v = ivec3(floor(localPos));
+                ivec3 isize = ivec3(size);
+                int voxelIdx = v.x + isize.x * (v.y + isize.y * v.z);
+
+                if (va_testShipUnderwaterView(ValkyrienAir_ShipUnderwaterViewMask, voxelIdx)) {
+                    float t = clamp((vertexDistance - 2.0) / 18.0, 0.0, 1.0);
+                    float strength = mix(0.35, 0.70, t);
+                    vec3 waterFog = mix(ValkyrienAir_ShipWaterTint, vec3(0.0, 0.2, 0.4), 0.35);
+
+                    color.rgb = mix(color.rgb, waterFog, strength);
+                    color.a = min(1.0, color.a + strength * 0.25);
+                }
+            }
+        }
     }
     fragColor = linear_fog(color, vertexDistance, FogStart, FogEnd, FogColor);
 }

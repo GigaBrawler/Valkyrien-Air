@@ -90,6 +90,10 @@ public final class ShipWaterPocketExternalWaterCullRenderContext {
         return worldTranslucentDepth > 0;
     }
 
+    public static int getWorldTranslucentDepth() {
+        return worldTranslucentDepth;
+    }
+
     public static boolean isInShipRender() {
         return shipRenderDepth > 0;
     }

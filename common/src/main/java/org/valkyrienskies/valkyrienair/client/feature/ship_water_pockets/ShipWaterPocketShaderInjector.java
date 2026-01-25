@@ -84,9 +84,13 @@ public final class ShipWaterPocketShaderInjector {
         uniform vec4 ValkyrienAir_WaterOverlayUv;
         uniform float ValkyrienAir_ShipWaterTintEnabled;
         uniform vec3 ValkyrienAir_ShipWaterTint;
+        uniform float ValkyrienAir_ShipUnderwaterViewEnabled;
+        uniform float ValkyrienAir_ShipPassCoordsAreShipSpace;
+        uniform float ValkyrienAir_CameraInWater;
 
 	        uniform vec4 ValkyrienAir_ShipAabbMin0;
 	        uniform vec4 ValkyrienAir_ShipAabbMax0;
+	        uniform vec3 ValkyrienAir_CameraShipPos0;
 	        uniform vec4 ValkyrienAir_GridSize0;
 	        uniform mat4 ValkyrienAir_WorldToShip0;
 	        uniform usampler2D ValkyrienAir_AirMask0;
@@ -94,6 +98,7 @@ public final class ShipWaterPocketShaderInjector {
 
 	        uniform vec4 ValkyrienAir_ShipAabbMin1;
 	        uniform vec4 ValkyrienAir_ShipAabbMax1;
+	        uniform vec3 ValkyrienAir_CameraShipPos1;
 	        uniform vec4 ValkyrienAir_GridSize1;
 	        uniform mat4 ValkyrienAir_WorldToShip1;
 	        uniform usampler2D ValkyrienAir_AirMask1;
@@ -101,6 +106,7 @@ public final class ShipWaterPocketShaderInjector {
 
 	        uniform vec4 ValkyrienAir_ShipAabbMin2;
 	        uniform vec4 ValkyrienAir_ShipAabbMax2;
+	        uniform vec3 ValkyrienAir_CameraShipPos2;
 	        uniform vec4 ValkyrienAir_GridSize2;
 	        uniform mat4 ValkyrienAir_WorldToShip2;
 	        uniform usampler2D ValkyrienAir_AirMask2;
@@ -108,10 +114,13 @@ public final class ShipWaterPocketShaderInjector {
 
 	        uniform vec4 ValkyrienAir_ShipAabbMin3;
 	        uniform vec4 ValkyrienAir_ShipAabbMax3;
+	        uniform vec3 ValkyrienAir_CameraShipPos3;
 	        uniform vec4 ValkyrienAir_GridSize3;
 	        uniform mat4 ValkyrienAir_WorldToShip3;
 	        uniform usampler2D ValkyrienAir_AirMask3;
 	        uniform usampler2D ValkyrienAir_OccMask3;
+
+	        uniform usampler2D ValkyrienAir_ShipUnderwaterViewMask;
 
         const int VA_MASK_TEX_WIDTH_SHIFT = 12;
         const int VA_MASK_TEX_WIDTH_MASK = (1 << VA_MASK_TEX_WIDTH_SHIFT) - 1;
@@ -141,6 +150,13 @@ public final class ShipWaterPocketShaderInjector {
             uint word = va_fetchWord(airMask, wordIndex);
             return ((word >> uint(bit)) & 1u) != 0u;
         }
+
+	        bool va_testShipUnderwaterView(usampler2D mask, int voxelIdx) {
+	            int wordIndex = voxelIdx >> 5;
+	            int bit = voxelIdx & 31;
+	            uint word = va_fetchWord(mask, wordIndex);
+	            return ((word >> uint(bit)) & 1u) != 0u;
+	        }
 
 	        bool va_testOcc(usampler2D occMask, int voxelIdx, int subIdx) {
 	            int wordIndex = voxelIdx * VA_OCC_WORDS_PER_VOXEL + (subIdx >> 5);
@@ -257,6 +273,38 @@ public final class ShipWaterPocketShaderInjector {
                     fragColor.rgb *= ValkyrienAir_ShipWaterTint;
                 }
 
+                if (ValkyrienAir_ShipUnderwaterViewEnabled > 0.5 && ValkyrienAir_CameraInWater < 0.5 && !va_isWaterUv(v_TexCoord)) {
+                    if (ValkyrienAir_GridSize0.x > 0.0) {
+                        vec3 camRelPos = valkyrienair_WorldPos;
+                        vec3 shipPos;
+                        if (ValkyrienAir_ShipPassCoordsAreShipSpace > 0.5) {
+                            shipPos = camRelPos + ValkyrienAir_CameraShipPos0;
+                        } else {
+                            shipPos = (ValkyrienAir_WorldToShip0 * vec4(camRelPos, 0.0)).xyz + ValkyrienAir_CameraShipPos0;
+                        }
+
+                        vec3 localPos = shipPos;
+                        vec3 size = ValkyrienAir_GridSize0.xyz;
+                        if (localPos.x >= 0.0 && localPos.y >= 0.0 && localPos.z >= 0.0 &&
+                            localPos.x < size.x && localPos.y < size.y && localPos.z < size.z) {
+
+                            ivec3 v = ivec3(floor(localPos));
+                            ivec3 isize = ivec3(size);
+                            int voxelIdx = v.x + isize.x * (v.y + isize.y * v.z);
+
+                            if (va_testShipUnderwaterView(ValkyrienAir_ShipUnderwaterViewMask, voxelIdx)) {
+                                float dist = length(camRelPos);
+                                float t = clamp((dist - 2.0) / 18.0, 0.0, 1.0);
+                                float strength = mix(0.35, 0.70, t);
+                                vec3 waterFog = mix(ValkyrienAir_ShipWaterTint, vec3(0.0, 0.2, 0.4), 0.35);
+
+                                fragColor.rgb = mix(fragColor.rgb, waterFog, strength);
+                                fragColor.a = min(1.0, fragColor.a + strength * 0.25);
+                            }
+                        }
+                    }
+                }
+
             """;
 
 	    private static final String EMBEDDIUM_FRAGMENT_MAIN_INJECT = """
@@ -274,6 +322,7 @@ public final class ShipWaterPocketShaderInjector {
 
     private static boolean loggedEmbeddiumVertexPatchFailed = false;
     private static boolean loggedEmbeddiumFragmentPatchFailed = false;
+    private static boolean loggedEmbeddiumUnderwaterViewPatchApplied = false;
 
     private static boolean isEmbeddiumBlockLayerShader(final String identifierPath, final String extension) {
         if (identifierPath == null) return false;
@@ -413,6 +462,11 @@ public final class ShipWaterPocketShaderInjector {
                 loggedEmbeddiumFragmentPatchFailed = true;
                 LOGGER.warn("Failed to fully patch Embeddium fragment shader for ship water culling; culling may be inactive");
             }
+        }
+
+        if (!loggedEmbeddiumUnderwaterViewPatchApplied && out.contains("ValkyrienAir_ShipUnderwaterViewEnabled")) {
+            loggedEmbeddiumUnderwaterViewPatchApplied = true;
+            LOGGER.info("Patched Embeddium chunk shader for ship underwater-view glass tint");
         }
 
         return out;
