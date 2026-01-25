@@ -45,6 +45,9 @@ public abstract class MixinEntity implements ShipWaterPocketEntityDuck {
     private static final FluidState vs$WATER = Fluids.WATER.defaultFluidState();
 
     @org.spongepowered.asm.mixin.Unique
+    private static final FluidState vs$EMPTY = Fluids.EMPTY.defaultFluidState();
+
+    @org.spongepowered.asm.mixin.Unique
     private long vs$airPocketCacheTick = Long.MIN_VALUE;
 
     @org.spongepowered.asm.mixin.Unique
@@ -77,10 +80,15 @@ public abstract class MixinEntity implements ShipWaterPocketEntityDuck {
         final double oz = Math.min(0.125, halfZ * 0.5);
 
         final double eyeY = this.getEyeY() - 0.1111111119389534;
-        if (vs$isInAirPocketAtHeight(level, eyeY, ox, oz)) return true;
-
         final double feetY = bb.minY + 0.1;
-        return vs$isInAirPocketAtHeight(level, feetY, ox, oz);
+
+        // If we're in any ship fluid (flooded pocket water, shipyard water blocks, etc) we should behave like we're
+        // in water, even if the space above is an air pocket.
+        if (vs$isInShipFluidAtHeight(level, eyeY, ox, oz) || vs$isInShipFluidAtHeight(level, feetY, ox, oz)) {
+            return false;
+        }
+
+        return vs$isInAirPocketAtHeight(level, eyeY, ox, oz) || vs$isInAirPocketAtHeight(level, feetY, ox, oz);
     }
 
     @org.spongepowered.asm.mixin.Unique
@@ -113,6 +121,38 @@ public abstract class MixinEntity implements ShipWaterPocketEntityDuck {
     private static boolean vs$isAirPocketAtPoint(final Level level, final double x, final double y, final double z) {
         final FluidState overridden = ShipWaterPocketManager.overrideWaterFluidState(level, x, y, z, vs$WATER);
         return overridden.isEmpty();
+    }
+
+    @org.spongepowered.asm.mixin.Unique
+    private boolean vs$isInShipFluidAtHeight(final Level level, final double y, final double ox, final double oz) {
+        final double x = this.getX();
+        final double z = this.getZ();
+
+        if (vs$isShipFluidAtPoint(level, x, y, z)) return true;
+        if (ox <= 0.0 && oz <= 0.0) return false;
+
+        if (ox > 0.0) {
+            if (vs$isShipFluidAtPoint(level, x + ox, y, z)) return true;
+            if (vs$isShipFluidAtPoint(level, x - ox, y, z)) return true;
+        }
+        if (oz > 0.0) {
+            if (vs$isShipFluidAtPoint(level, x, y, z + oz)) return true;
+            if (vs$isShipFluidAtPoint(level, x, y, z - oz)) return true;
+        }
+        if (ox > 0.0 && oz > 0.0) {
+            if (vs$isShipFluidAtPoint(level, x + ox, y, z + oz)) return true;
+            if (vs$isShipFluidAtPoint(level, x + ox, y, z - oz)) return true;
+            if (vs$isShipFluidAtPoint(level, x - ox, y, z + oz)) return true;
+            if (vs$isShipFluidAtPoint(level, x - ox, y, z - oz)) return true;
+        }
+
+        return false;
+    }
+
+    @org.spongepowered.asm.mixin.Unique
+    private static boolean vs$isShipFluidAtPoint(final Level level, final double x, final double y, final double z) {
+        final FluidState overridden = ShipWaterPocketManager.overrideWaterFluidState(level, x, y, z, vs$EMPTY);
+        return !overridden.isEmpty();
     }
 
     @WrapOperation(

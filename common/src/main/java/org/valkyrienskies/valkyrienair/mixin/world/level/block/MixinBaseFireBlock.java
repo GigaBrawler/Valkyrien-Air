@@ -6,8 +6,6 @@ import net.minecraft.core.Direction;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.BaseFireBlock;
 import net.minecraft.world.level.block.Blocks;
-import net.minecraft.world.level.material.FluidState;
-import net.minecraft.world.level.material.Fluids;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
 import org.valkyrienskies.valkyrienair.config.ValkyrienAirConfig;
@@ -15,9 +13,6 @@ import org.valkyrienskies.valkyrienair.feature.ship_water_pockets.ShipWaterPocke
 
 @Mixin(BaseFireBlock.class)
 public abstract class MixinBaseFireBlock {
-
-    @org.spongepowered.asm.mixin.Unique
-    private static final FluidState vs$WATER = Fluids.WATER.defaultFluidState();
 
     @ModifyExpressionValue(
         method = "canBePlacedAt(Lnet/minecraft/world/level/Level;Lnet/minecraft/core/BlockPos;Lnet/minecraft/core/Direction;)Z",
@@ -29,9 +24,6 @@ public abstract class MixinBaseFireBlock {
         if (!ValkyrienAirConfig.getEnableShipWaterPockets()) return false;
 
         if (!level.getBlockState(pos).is(Blocks.WATER)) return false;
-
-        final FluidState overridden = ShipWaterPocketManager.overrideWaterFluidState(level, pos, vs$WATER);
-        return overridden.isEmpty();
+        return ShipWaterPocketManager.isWorldPosInShipAirPocket(level, pos);
     }
 }
-

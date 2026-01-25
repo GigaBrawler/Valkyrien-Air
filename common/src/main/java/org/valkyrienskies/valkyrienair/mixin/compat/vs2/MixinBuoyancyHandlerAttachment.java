@@ -1,14 +1,13 @@
 package org.valkyrienskies.valkyrienair.mixin.compat.vs2;
 
+import org.joml.Vector3d;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Unique;
-import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.valkyrienskies.core.api.ships.PhysShip;
 import org.valkyrienskies.core.api.world.PhysLevel;
-import org.valkyrienskies.mod.common.config.VSGameConfig;
 import org.valkyrienskies.mod.common.util.BuoyancyHandlerAttachment;
 import org.valkyrienskies.valkyrienair.config.ValkyrienAirConfig;
 import org.valkyrienskies.valkyrienair.mixinducks.compat.vs2.ValkyrienAirBuoyancyAttachmentDuck;
@@ -16,8 +15,14 @@ import org.valkyrienskies.valkyrienair.mixinducks.compat.vs2.ValkyrienAirBuoyanc
 @Mixin(value = BuoyancyHandlerAttachment.class, remap = false)
 public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoyancyAttachmentDuck {
 
-    @Shadow
-    public BuoyancyHandlerAttachment.BuoyancyData buoyancyData;
+    @Unique
+    private static final double valkyrienair$WATER_DENSITY = 1000.0;
+
+    @Unique
+    private static final double valkyrienair$GRAVITY_MAGNITUDE = 10.0;
+
+    @Unique
+    private volatile double valkyrienair$displacedVolume = 0.0;
 
     @Unique
     private volatile boolean valkyrienair$hasPocketCenter = false;
@@ -30,6 +35,22 @@ public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoy
 
     @Unique
     private volatile double valkyrienair$pocketCenterZ = 0.0;
+
+    @Unique
+    private final Vector3d valkyrienair$tmpForce = new Vector3d();
+
+    @Unique
+    private final Vector3d valkyrienair$tmpPos = new Vector3d();
+
+    @Override
+    public double valkyrienair$getDisplacedVolume() {
+        return valkyrienair$displacedVolume;
+    }
+
+    @Override
+    public void valkyrienair$setDisplacedVolume(final double volume) {
+        valkyrienair$displacedVolume = volume;
+    }
 
     @Override
     public boolean valkyrienair$hasPocketCenter() {
@@ -62,22 +83,19 @@ public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoy
     @Inject(method = "physTick", at = @At("HEAD"), cancellable = true)
     private void valkyrienair$disableVs2PocketBuoyancy(final PhysShip physShip, final PhysLevel physLevel,
         final CallbackInfo ci) {
-        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) return;
-        if (!VSGameConfig.SERVER.getEnablePocketBuoyancy()) return;
-
-        // Disable VS2's stock pocket buoyancy calculation and apply our own pocket volume results.
+        // Disable VS2's experimental pocket buoyancy and apply Valkyrien-Air's own buoyancy forces instead.
         ci.cancel();
 
-        final double netVolume = buoyancyData.getPocketVolumeTotal();
-        final double perVolume = VSGameConfig.SERVER.getBuoyancyFactorPerPocketVolume();
-        final double coverage = Math.max(0.0, Math.min(1.0, physShip.getLiquidOverlap()));
+        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) return;
+        if (!valkyrienair$hasPocketCenter) return;
 
-        // Use buoyantFactor (VS2's native integration) instead of directly applying forces.
-        //
-        // This keeps the ship stable and lets VS2's own fluid-drag + buoyancy integration handle the dynamics.
-        double factor = 1.0 + (netVolume * perVolume * coverage);
-        if (factor < 0.0) factor = 0.0;
-        physShip.setBuoyantFactor(factor);
+        final double displaced = valkyrienair$displacedVolume;
+        if (displaced <= 1.0e-6) return;
+
+        final double upwardForce = displaced * valkyrienair$WATER_DENSITY * valkyrienair$GRAVITY_MAGNITUDE;
+        valkyrienair$tmpForce.set(0.0, upwardForce, 0.0);
+        valkyrienair$tmpPos.set(valkyrienair$pocketCenterX, valkyrienair$pocketCenterY, valkyrienair$pocketCenterZ);
+        physShip.applyWorldForceToModelPos(valkyrienair$tmpForce, valkyrienair$tmpPos);
         physShip.setDoFluidDrag(true);
     }
 }

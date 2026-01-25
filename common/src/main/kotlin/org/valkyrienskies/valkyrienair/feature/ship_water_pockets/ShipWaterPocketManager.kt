@@ -81,24 +81,16 @@ object ShipWaterPocketManager {
     )
 
     private data class BuoyancyMetrics(
-        var sealedAirVolume: Double = 0.0,
-        var floodedVolume: Double = 0.0,
-        var sealedAirSumX: Double = 0.0,
-        var sealedAirSumY: Double = 0.0,
-        var sealedAirSumZ: Double = 0.0,
-        var floodedSumX: Double = 0.0,
-        var floodedSumY: Double = 0.0,
-        var floodedSumZ: Double = 0.0,
+        var submergedAirVolume: Double = 0.0,
+        var submergedAirSumX: Double = 0.0,
+        var submergedAirSumY: Double = 0.0,
+        var submergedAirSumZ: Double = 0.0,
     ) {
         fun reset() {
-            sealedAirVolume = 0.0
-            floodedVolume = 0.0
-            sealedAirSumX = 0.0
-            sealedAirSumY = 0.0
-            sealedAirSumZ = 0.0
-            floodedSumX = 0.0
-            floodedSumY = 0.0
-            floodedSumZ = 0.0
+            submergedAirVolume = 0.0
+            submergedAirSumX = 0.0
+            submergedAirSumY = 0.0
+            submergedAirSumZ = 0.0
         }
     }
 
@@ -221,7 +213,15 @@ object ShipWaterPocketManager {
             val needsRecompute = state.dirty || state.sizeX != sizeX || state.sizeY != sizeY || state.sizeZ != sizeZ ||
                 state.minX != minX || state.minY != minY || state.minZ != minZ
             if (needsRecompute) {
-                recomputeState(level, ship, state, minX, minY, minZ, sizeX, sizeY, sizeZ)
+                // When (re)loading a ship, the shipyard chunks can arrive a few ticks after the ship object itself.
+                // If we recompute while those chunks are still unloaded, `getBlockState` returns air everywhere, which
+                // makes the ship appear entirely "open" and disables all air pockets until another shipyard block
+                // update marks the ship dirty again.
+                if (!areShipyardChunksLoaded(level, baseMinX, baseMinY, baseMinZ, baseSizeX, baseSizeY, baseSizeZ)) {
+                    state.dirty = true
+                } else {
+                    recomputeState(level, ship, state, minX, minY, minZ, sizeX, sizeY, sizeZ)
+                }
             }
 
             val now = level.gameTime
@@ -261,39 +261,19 @@ object ShipWaterPocketManager {
         val buoyancyHandler = serverShip.getAttachment(BuoyancyHandlerAttachment::class.java) ?: return
         val buoyancyDuck = buoyancyHandler as? ValkyrienAirBuoyancyAttachmentDuck
 
-        // Net buoyancy volume:
-        // - sealed submerged air increases buoyancy
-        // - flooded submerged interior decreases buoyancy (water mass)
-        val sealedAir = state.buoyancy.sealedAirVolume
-        val flooded = state.buoyancy.floodedVolume
-        var net = sealedAir - flooded
-
-        // Avoid crazy values if something goes wrong.
+        // The additional buoyant force from pockets is just the volume of *submerged interior air* that is currently
+        // not flooded (i.e. displacing world water).
         val maxAbs = state.interior.cardinality().toDouble().coerceAtLeast(1.0)
-        net = net.coerceIn(-maxAbs, maxAbs)
-
-        buoyancyHandler.buoyancyData.pocketVolumeTotal = net
-
-        // Apply buoyancy at the net center of pressure (positive air - negative flooded water).
-        val netSumX = state.buoyancy.sealedAirSumX - state.buoyancy.floodedSumX
-        val netSumY = state.buoyancy.sealedAirSumY - state.buoyancy.floodedSumY
-        val netSumZ = state.buoyancy.sealedAirSumZ - state.buoyancy.floodedSumZ
+        val displaced = state.buoyancy.submergedAirVolume.coerceIn(0.0, maxAbs)
+        buoyancyDuck?.`valkyrienair$setDisplacedVolume`(displaced)
 
         val centerX: Double
         val centerY: Double
         val centerZ: Double
-        if (kotlin.math.abs(net) > 1.0e-6) {
-            centerX = netSumX / net
-            centerY = netSumY / net
-            centerZ = netSumZ / net
-        } else if (sealedAir > 0.0) {
-            centerX = state.buoyancy.sealedAirSumX / sealedAir
-            centerY = state.buoyancy.sealedAirSumY / sealedAir
-            centerZ = state.buoyancy.sealedAirSumZ / sealedAir
-        } else if (flooded > 0.0) {
-            centerX = state.buoyancy.floodedSumX / flooded
-            centerY = state.buoyancy.floodedSumY / flooded
-            centerZ = state.buoyancy.floodedSumZ / flooded
+        if (displaced > 1.0e-6) {
+            centerX = state.buoyancy.submergedAirSumX / displaced
+            centerY = state.buoyancy.submergedAirSumY / displaced
+            centerZ = state.buoyancy.submergedAirSumZ / displaced
         } else {
             centerX = 0.0
             centerY = 0.0
@@ -898,7 +878,7 @@ object ShipWaterPocketManager {
                 shipBlockPosTmp.set(openPos)
             }
 
-            if (isAirPocket(state, shipBlockPosTmp)) {
+            if (findNearbyAirPocket(state, shipPosTmp, shipBlockPosTmp, radius = 1) != null) {
                 return true
             }
         }
@@ -946,9 +926,8 @@ object ShipWaterPocketManager {
                 shipBlockPosTmp.set(openPos)
             }
 
-            if (isAirPocket(state, shipBlockPosTmp)) {
-                return BlockPos(shipBlockPosTmp.x, shipBlockPosTmp.y, shipBlockPosTmp.z)
-            }
+            val airPos = findNearbyAirPocket(state, shipPosTmp, shipBlockPosTmp, radius = 1) ?: continue
+            return BlockPos(airPos.x, airPos.y, airPos.z)
         }
 
         return null
@@ -1130,6 +1109,82 @@ object ShipWaterPocketManager {
         val idx = indexOf(state, lx, ly, lz)
         // "Air pocket" is only meaningful for watertight interior cells (not exterior air above the waterline).
         return state.interior.get(idx) && !state.materializedWater.get(idx)
+    }
+
+    private fun findNearbyAirPocket(
+        state: ShipPocketState,
+        shipPos: Vector3d,
+        shipBlockPos: BlockPos.MutableBlockPos,
+        radius: Int,
+    ): BlockPos.MutableBlockPos? {
+        val baseX = shipBlockPos.x
+        val baseY = shipBlockPos.y
+        val baseZ = shipBlockPos.z
+
+        if (isAirPocket(state, shipBlockPos)) return shipBlockPos
+
+        val e = POINT_QUERY_EPS
+        for (dxi in -1..1) {
+            val dx = dxi.toDouble() * e
+            for (dyi in -1..1) {
+                val dy = dyi.toDouble() * e
+                for (dzi in -1..1) {
+                    val dz = dzi.toDouble() * e
+                    if (dx == 0.0 && dy == 0.0 && dz == 0.0) continue
+                    shipBlockPos.set(
+                        Mth.floor(shipPos.x + dx),
+                        Mth.floor(shipPos.y + dy),
+                        Mth.floor(shipPos.z + dz),
+                    )
+                    if (isAirPocket(state, shipBlockPos)) return shipBlockPos
+                }
+            }
+        }
+
+        if (radius <= 0) return null
+
+        var bestDistSq = Double.POSITIVE_INFINITY
+        var bestX = 0
+        var bestY = 0
+        var bestZ = 0
+
+        val x = shipPos.x
+        val y = shipPos.y
+        val z = shipPos.z
+
+        for (dx in -radius..radius) {
+            val px = baseX + dx
+            val cx = px + 0.5
+            val ddx = x - cx
+            for (dy in -radius..radius) {
+                val py = baseY + dy
+                val cy = py + 0.5
+                val ddy = y - cy
+                for (dz in -radius..radius) {
+                    val pz = baseZ + dz
+                    shipBlockPos.set(px, py, pz)
+                    if (!isAirPocket(state, shipBlockPos)) continue
+
+                    val cz = pz + 0.5
+                    val ddz = z - cz
+                    val distSq = ddx * ddx + ddy * ddy + ddz * ddz
+
+                    if (distSq < bestDistSq - 1e-12) {
+                        bestDistSq = distSq
+                        bestX = px
+                        bestY = py
+                        bestZ = pz
+                    }
+                }
+            }
+        }
+
+        if (bestDistSq != Double.POSITIVE_INFINITY) {
+            shipBlockPos.set(bestX, bestY, bestZ)
+            return shipBlockPos
+        }
+
+        return null
     }
 
     private fun indexOf(state: ShipPocketState, lx: Int, ly: Int, lz: Int): Int =
@@ -1633,8 +1688,8 @@ object ShipWaterPocketManager {
                 }
             }
 
-            // Buoyancy accounting: only sealed (no air vents) submerged air contributes positively.
-            // Flooded submerged interior contributes negatively (water mass) regardless of venting.
+            // Buoyancy accounting:
+            // - Only *submerged* interior air displaces world water and contributes buoyancy.
             if (buoyancy != null) {
                 for (i in 0 until tail) {
                     val cellIdx = componentQueue[i]
@@ -1649,20 +1704,12 @@ object ShipWaterPocketManager {
                     val sy = minY + ly + 0.5
                     val sz = minZ + lz + 0.5
 
-                    val isFlooded = materializedWater != null && materializedWater.get(cellIdx)
-                    if (isFlooded) {
-                        buoyancy.floodedVolume += 1.0
-                        buoyancy.floodedSumX += sx
-                        buoyancy.floodedSumY += sy
-                        buoyancy.floodedSumZ += sz
-                        continue
-                    }
+                    if (materializedWater != null && materializedWater.get(cellIdx)) continue
 
-                    if (hasAirVent) continue
-                    buoyancy.sealedAirVolume += 1.0
-                    buoyancy.sealedAirSumX += sx
-                    buoyancy.sealedAirSumY += sy
-                    buoyancy.sealedAirSumZ += sz
+                    buoyancy.submergedAirVolume += 1.0
+                    buoyancy.submergedAirSumX += sx
+                    buoyancy.submergedAirSumY += sy
+                    buoyancy.submergedAirSumZ += sz
                 }
             }
 
