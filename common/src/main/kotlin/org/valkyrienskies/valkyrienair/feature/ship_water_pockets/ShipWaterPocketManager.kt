@@ -701,15 +701,16 @@ object ShipWaterPocketManager {
             val baseY = shipBlockPosTmp.y
             val baseZ = shipBlockPosTmp.z
 
+            val shipFluid = findShipFluidAtShipPoint(level, shipPosTmp, shipBlockPosTmp)
+            if (!shipFluid.isEmpty) return shipFluid
+            shipBlockPosTmp.set(baseX, baseY, baseZ)
+
             val inAirPocket = if (!original.isEmpty && original.`is`(FluidTags.WATER)) {
                 findNearbyAirPocket(state, shipPosTmp, shipBlockPosTmp, radius = 1) != null
             } else {
                 false
             }
             shipBlockPosTmp.set(baseX, baseY, baseZ)
-
-            val shipFluid = level.getBlockState(shipBlockPosTmp).fluidState
-            if (!shipFluid.isEmpty) return shipFluid
 
             if (inAirPocket) {
                 // We are inside a sealed ship air pocket; treat world water as air.
@@ -761,15 +762,16 @@ object ShipWaterPocketManager {
             val baseY = shipBlockPosTmp.y
             val baseZ = shipBlockPosTmp.z
 
+            val shipFluid = findShipFluidAtShipPoint(level, shipPosTmp, shipBlockPosTmp)
+            if (!shipFluid.isEmpty) return shipFluid
+            shipBlockPosTmp.set(baseX, baseY, baseZ)
+
             val inAirPocket = if (!original.isEmpty && original.`is`(FluidTags.WATER)) {
                 findNearbyAirPocket(state, shipPosTmp, shipBlockPosTmp, radius = 1) != null
             } else {
                 false
             }
             shipBlockPosTmp.set(baseX, baseY, baseZ)
-
-            val shipFluid = level.getBlockState(shipBlockPosTmp).fluidState
-            if (!shipFluid.isEmpty) return shipFluid
 
             if (inAirPocket) {
                 // We are inside a sealed ship air pocket; treat world water as air.
@@ -839,7 +841,7 @@ object ShipWaterPocketManager {
                 shipBlockPosTmp.set(openPos)
             }
 
-            val shipFluid = level.getBlockState(shipBlockPosTmp).fluidState
+            val shipFluid = findShipFluidAtShipPoint(level, shipPosTmp, shipBlockPosTmp)
             if (shipFluid.isEmpty) continue
 
             cache.height = shipFluid.getHeight(level, shipBlockPosTmp)
@@ -881,9 +883,20 @@ object ShipWaterPocketManager {
      */
     @JvmStatic
     fun isWorldPosInShipAirPocket(level: Level, worldBlockPos: BlockPos): Boolean {
-        if (!ValkyrienAirConfig.enableShipWaterPockets) return false
-        if (level.isBlockInShipyard(worldBlockPos)) return false
+        return isWorldPosInShipAirPocket(
+            level,
+            worldBlockPos.x + 0.5,
+            worldBlockPos.y + 0.5,
+            worldBlockPos.z + 0.5
+        )
+    }
 
+    @JvmStatic
+    fun isWorldPosInShipAirPocket(level: Level, worldX: Double, worldY: Double, worldZ: Double): Boolean {
+        if (!ValkyrienAirConfig.enableShipWaterPockets) return false
+        if (level.isBlockInShipyard(worldX, worldY, worldZ)) return false
+
+        val worldBlockPos = BlockPos.containing(worldX, worldY, worldZ)
         val queryAabb = tmpQueryAabb.get().apply {
             minX = worldBlockPos.x.toDouble()
             minY = worldBlockPos.y.toDouble()
@@ -892,11 +905,7 @@ object ShipWaterPocketManager {
             maxY = (worldBlockPos.y + 1).toDouble()
             maxZ = (worldBlockPos.z + 1).toDouble()
         }
-        val worldPos = tmpWorldPos.get().set(
-            worldBlockPos.x + 0.5,
-            worldBlockPos.y + 0.5,
-            worldBlockPos.z + 0.5
-        )
+        val worldPos = tmpWorldPos.get().set(worldX, worldY, worldZ)
         val shipPosTmp = tmpShipPos.get()
         val shipBlockPosTmp = tmpShipBlockPos.get()
 
@@ -1143,6 +1152,41 @@ object ShipWaterPocketManager {
         val idx = indexOf(state, lx, ly, lz)
         // "Air pocket" is only meaningful for watertight interior cells (not exterior air above the waterline).
         return state.interior.get(idx) && !state.materializedWater.get(idx)
+    }
+
+    private fun findShipFluidAtShipPoint(
+        level: Level,
+        shipPos: Vector3d,
+        shipBlockPos: BlockPos.MutableBlockPos,
+    ): net.minecraft.world.level.material.FluidState {
+        val baseX = shipBlockPos.x
+        val baseY = shipBlockPos.y
+        val baseZ = shipBlockPos.z
+
+        var shipFluid = level.getBlockState(shipBlockPos).fluidState
+        if (!shipFluid.isEmpty) return shipFluid
+
+        val e = POINT_QUERY_EPS
+        for (dxi in -1..1) {
+            val dx = dxi.toDouble() * e
+            for (dyi in -1..1) {
+                val dy = dyi.toDouble() * e
+                for (dzi in -1..1) {
+                    val dz = dzi.toDouble() * e
+                    if (dxi == 0 && dyi == 0 && dzi == 0) continue
+                    shipBlockPos.set(
+                        Mth.floor(shipPos.x + dx),
+                        Mth.floor(shipPos.y + dy),
+                        Mth.floor(shipPos.z + dz),
+                    )
+                    shipFluid = level.getBlockState(shipBlockPos).fluidState
+                    if (!shipFluid.isEmpty) return shipFluid
+                }
+            }
+        }
+
+        shipBlockPos.set(baseX, baseY, baseZ)
+        return shipFluid
     }
 
     private fun findNearbyAirPocket(
