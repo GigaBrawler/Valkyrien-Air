@@ -83,25 +83,40 @@ public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoy
     @Inject(method = "physTick", at = @At("HEAD"), cancellable = true)
     private void valkyrienair$disableVs2PocketBuoyancy(final PhysShip physShip, final PhysLevel physLevel,
         final CallbackInfo ci) {
+        if (!ValkyrienAirConfig.getEnableShipWaterPockets()) return;
+
         // Disable VS2's experimental pocket buoyancy and apply Valkyrien-Air's own buoyancy forces instead.
         ci.cancel();
 
-        // Also disable VS2's built-in buoyancy forces. Valkyrien-Air models buoyancy based on displaced water volume
-        // (submerged interior air that hasn't flooded), rather than relying on VS2's experimental buoyancy behavior.
-        if (ValkyrienAirConfig.getEnableShipWaterPockets()) {
-            physShip.setBuoyantFactor(0.0);
-        } else {
-            return;
-        }
+        // Reset VS2's buoyancy scaling to a stable baseline (VS2's pocket buoyancy works by inflating this value).
+        // Setting this to 0.0 can destabilize physics, so we keep the default scale and apply our own pocket forces.
+        physShip.setBuoyantFactor(1.0);
 
         if (!valkyrienair$hasPocketCenter) return;
 
         final double displaced = valkyrienair$displacedVolume;
+        if (!Double.isFinite(displaced)) return;
         if (displaced <= 1.0e-6) return;
 
-        final double upwardForce = displaced * valkyrienair$WATER_DENSITY * valkyrienair$GRAVITY_MAGNITUDE;
+        final double pocketX = valkyrienair$pocketCenterX;
+        final double pocketY = valkyrienair$pocketCenterY;
+        final double pocketZ = valkyrienair$pocketCenterZ;
+        if (!Double.isFinite(pocketX) || !Double.isFinite(pocketY) || !Double.isFinite(pocketZ)) return;
+
+        double upwardForce = displaced * valkyrienair$WATER_DENSITY * valkyrienair$GRAVITY_MAGNITUDE;
+        if (!Double.isFinite(upwardForce) || upwardForce <= 0.0) return;
+
+        // Clamp to prevent runaway impulses if a ship has extremely low mass relative to displaced air volume.
+        final double mass = physShip.getMass();
+        if (!Double.isFinite(mass) || mass <= 1.0e-6) return;
+
+        final double maxForce = mass * valkyrienair$GRAVITY_MAGNITUDE * 5.0;
+        if (Double.isFinite(maxForce) && maxForce > 0.0) {
+            upwardForce = Math.min(upwardForce, maxForce);
+        }
+
         valkyrienair$tmpForce.set(0.0, upwardForce, 0.0);
-        valkyrienair$tmpPos.set(valkyrienair$pocketCenterX, valkyrienair$pocketCenterY, valkyrienair$pocketCenterZ);
+        valkyrienair$tmpPos.set(pocketX, pocketY, pocketZ);
         physShip.applyWorldForceToModelPos(valkyrienair$tmpForce, valkyrienair$tmpPos);
         physShip.setDoFluidDrag(true);
     }
