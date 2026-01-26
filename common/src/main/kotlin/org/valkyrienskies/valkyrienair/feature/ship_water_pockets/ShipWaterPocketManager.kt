@@ -27,7 +27,6 @@ import net.minecraft.world.phys.Vec3
 import org.apache.logging.log4j.LogManager
 import org.joml.Vector3d
 import org.joml.primitives.AABBd
-import org.valkyrienskies.core.api.ships.ClientShip
 import org.valkyrienskies.core.api.ships.LoadedShip
 import org.valkyrienskies.core.api.ships.LoadedServerShip
 import org.valkyrienskies.core.api.ships.Ship
@@ -1279,7 +1278,7 @@ object ShipWaterPocketManager {
     }
 
     private fun getQueryTransform(ship: Ship): ShipTransform {
-        return if (ship is ClientShip) ship.renderTransform else ship.transform
+        return ship.transform
     }
 
     private fun recomputeState(
