@@ -16,7 +16,6 @@
     "samplers": [
         { "name": "Sampler0" },
         { "name": "Sampler2" },
-        { "name": "ValkyrienAir_FluidMask" },
         { "name": "ValkyrienAir_AirMask0" },
         { "name": "ValkyrienAir_AirMask1" },
         { "name": "ValkyrienAir_AirMask2" },
@@ -50,6 +49,9 @@
         { "name": "ValkyrienAir_CameraShipPos0", "type": "float", "count": 3, "values": [ 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridMin0", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridSize0", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidStillUv0", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidFlowUv0", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidOverlayUv0", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_WorldToShip0", "type": "matrix4x4", "count": 16, "values": [ 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0 ] },
 
         { "name": "ValkyrienAir_ShipAabbMin1", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
@@ -57,6 +59,9 @@
         { "name": "ValkyrienAir_CameraShipPos1", "type": "float", "count": 3, "values": [ 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridMin1", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridSize1", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidStillUv1", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidFlowUv1", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidOverlayUv1", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_WorldToShip1", "type": "matrix4x4", "count": 16, "values": [ 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0 ] },
 
         { "name": "ValkyrienAir_ShipAabbMin2", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
@@ -64,6 +69,9 @@
         { "name": "ValkyrienAir_CameraShipPos2", "type": "float", "count": 3, "values": [ 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridMin2", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridSize2", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidStillUv2", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidFlowUv2", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidOverlayUv2", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_WorldToShip2", "type": "matrix4x4", "count": 16, "values": [ 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0 ] },
 
         { "name": "ValkyrienAir_ShipAabbMin3", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
@@ -71,6 +79,9 @@
         { "name": "ValkyrienAir_CameraShipPos3", "type": "float", "count": 3, "values": [ 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridMin3", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_GridSize3", "type": "float", "count": 4, "values": [ 0.0, 0.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidStillUv3", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidFlowUv3", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
+        { "name": "ValkyrienAir_CullFluidOverlayUv3", "type": "float", "count": 4, "values": [ 1.0, 1.0, 0.0, 0.0 ] },
         { "name": "ValkyrienAir_WorldToShip3", "type": "matrix4x4", "count": 16, "values": [ 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0 ] }
     ]
 }

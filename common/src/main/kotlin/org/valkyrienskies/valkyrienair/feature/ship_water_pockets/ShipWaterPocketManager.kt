@@ -759,6 +759,7 @@ object ShipWaterPocketManager {
 
     data class ClientWaterReachableSnapshot(
         val geometryRevision: Long,
+        val floodFluid: Fluid,
         val minX: Int,
         val minY: Int,
         val minZ: Int,
@@ -776,6 +777,7 @@ object ShipWaterPocketManager {
         val state = clientStates[level.dimensionId]?.get(shipId) ?: return null
         return ClientWaterReachableSnapshot(
             state.geometryRevision,
+            state.floodFluid,
             state.minX,
             state.minY,
             state.minZ,
