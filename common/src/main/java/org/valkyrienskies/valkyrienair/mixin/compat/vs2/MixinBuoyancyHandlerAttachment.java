@@ -22,13 +22,22 @@ public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoy
     private static final double valkyrienair$GRAVITY_MAGNITUDE = 10.0;
 
     @Unique
-    private static final double valkyrienair$MAX_POCKET_BUOYANCY_WEIGHT_MULT = 1.25;
+    private static final double valkyrienair$MAX_POCKET_BUOYANCY_WEIGHT_MULT = 1.0;
+
+    @Unique
+    private static final double valkyrienair$DEFAULT_FLUID_VISCOSITY = 1000.0;
 
     @Unique
     private volatile double valkyrienair$displacedVolume = 0.0;
 
     @Unique
     private volatile boolean valkyrienair$hasPocketCenter = false;
+
+    @Unique
+    private volatile double valkyrienair$buoyancyFluidDensity = valkyrienair$WATER_DENSITY;
+
+    @Unique
+    private volatile double valkyrienair$buoyancyFluidViscosity = valkyrienair$DEFAULT_FLUID_VISCOSITY;
 
     @Unique
     private volatile double valkyrienair$pocketCenterX = 0.0;
@@ -83,6 +92,26 @@ public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoy
         valkyrienair$hasPocketCenter = true;
     }
 
+    @Override
+    public double valkyrienair$getBuoyancyFluidDensity() {
+        return valkyrienair$buoyancyFluidDensity;
+    }
+
+    @Override
+    public double valkyrienair$getBuoyancyFluidViscosity() {
+        return valkyrienair$buoyancyFluidViscosity;
+    }
+
+    @Override
+    public void valkyrienair$setBuoyancyFluidDensity(final double density) {
+        valkyrienair$buoyancyFluidDensity = density;
+    }
+
+    @Override
+    public void valkyrienair$setBuoyancyFluidViscosity(final double viscosity) {
+        valkyrienair$buoyancyFluidViscosity = viscosity;
+    }
+
     @Inject(method = "physTick", at = @At("HEAD"), cancellable = true)
     private void valkyrienair$disableVs2PocketBuoyancy(final PhysShip physShip, final PhysLevel physLevel,
         final CallbackInfo ci) {
@@ -109,7 +138,11 @@ public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoy
         final double overlap = physShip.getLiquidOverlap();
         if (!Double.isFinite(overlap) || overlap <= 1.0e-6) return;
 
-        double upwardForce = displaced * valkyrienair$WATER_DENSITY * valkyrienair$GRAVITY_MAGNITUDE * overlap;
+        double density = valkyrienair$buoyancyFluidDensity;
+        if (!Double.isFinite(density) || density <= 0.0) density = valkyrienair$WATER_DENSITY;
+        density = Math.max(100.0, Math.min(density, 20_000.0));
+
+        double upwardForce = displaced * density * valkyrienair$GRAVITY_MAGNITUDE * overlap;
         if (!Double.isFinite(upwardForce) || upwardForce <= 0.0) return;
 
         // Clamp to prevent runaway impulses if a ship has extremely low mass relative to displaced air volume.
@@ -125,5 +158,33 @@ public abstract class MixinBuoyancyHandlerAttachment implements ValkyrienAirBuoy
         valkyrienair$tmpPos.set(pocketX, pocketY, pocketZ);
         physShip.applyWorldForceToModelPos(valkyrienair$tmpForce, valkyrienair$tmpPos);
         physShip.setDoFluidDrag(true);
+
+        // Extra damping for very viscous fluids (e.g. lava) to prevent "bounce"/launch oscillations at depth.
+        double viscosity = valkyrienair$buoyancyFluidViscosity;
+        if (Double.isFinite(viscosity) && viscosity > valkyrienair$DEFAULT_FLUID_VISCOSITY * 1.5) {
+            viscosity = Math.max(100.0, Math.min(viscosity, 200_000.0));
+            final double viscosityScale = Math.max(0.25, Math.min(viscosity / valkyrienair$DEFAULT_FLUID_VISCOSITY, 20.0));
+
+            final var vel = physShip.getVelocity();
+            final double baseDamping = 0.35;
+            final double damping = baseDamping * viscosityScale * overlap;
+
+            double fx = -vel.x() * mass * damping;
+            double fy = -vel.y() * mass * damping;
+            double fz = -vel.z() * mass * damping;
+
+            final double maxDamp = mass * valkyrienair$GRAVITY_MAGNITUDE * 3.0;
+            fx = clamp(fx, -maxDamp, maxDamp);
+            fy = clamp(fy, -maxDamp, maxDamp);
+            fz = clamp(fz, -maxDamp, maxDamp);
+
+            valkyrienair$tmpForce.set(fx, fy, fz);
+            physShip.applyWorldForceToModelPos(valkyrienair$tmpForce, physShip.getCenterOfMass());
+        }
+    }
+
+    @Unique
+    private static double clamp(final double v, final double min, final double max) {
+        return v < min ? min : Math.min(v, max);
     }
 }

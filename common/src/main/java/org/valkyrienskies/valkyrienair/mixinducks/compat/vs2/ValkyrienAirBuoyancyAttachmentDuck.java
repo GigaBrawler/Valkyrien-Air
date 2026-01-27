@@ -27,4 +27,18 @@ public interface ValkyrienAirBuoyancyAttachmentDuck {
     double valkyrienair$getPocketCenterZ();
 
     void valkyrienair$setPocketCenter(double x, double y, double z);
+
+    /**
+     * @return Density (kg/m^3) of the exterior liquid the ship is currently interacting with.
+     */
+    double valkyrienair$getBuoyancyFluidDensity();
+
+    /**
+     * @return Viscosity (arbitrary Minecraft/Forge units) of the exterior liquid the ship is currently interacting with.
+     */
+    double valkyrienair$getBuoyancyFluidViscosity();
+
+    void valkyrienair$setBuoyancyFluidDensity(double density);
+
+    void valkyrienair$setBuoyancyFluidViscosity(double viscosity);
 }

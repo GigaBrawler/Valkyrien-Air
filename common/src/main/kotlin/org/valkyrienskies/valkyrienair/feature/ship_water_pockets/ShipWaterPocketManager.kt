@@ -2,6 +2,7 @@ package org.valkyrienskies.valkyrienair.feature.ship_water_pockets
 
 import it.unimi.dsi.fastutil.ints.Int2DoubleOpenHashMap
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet
+import net.minecraft.core.Direction
 import net.minecraft.core.BlockPos
 import net.minecraft.core.particles.ParticleTypes
 import net.minecraft.world.phys.AABB
@@ -51,6 +52,7 @@ object ShipWaterPocketManager {
     private const val MAX_SIM_VOLUME = 2_000_000
     private const val POCKET_BOUNDS_PADDING = 1
     private const val AIR_PRESSURE_Y_EPS = 1e-7
+    private const val GRAVITY_RESETTLE_MAX_SCHEDULED_TICKS_PER_SHIP_PER_TICK = 4096
     // Flooding speed: this is an abstract "water plane rise" rate. Bigger/more holes increase the rise rate.
     private const val FLOOD_RISE_PER_TICK_BASE = 0.01
     private const val FLOOD_RISE_PER_TICK_PER_HOLE_FACE = 0.02
@@ -85,6 +87,10 @@ object ShipWaterPocketManager {
         var dirty: Boolean = true,
         var lastFloodUpdateTick: Long = Long.MIN_VALUE,
         var lastWaterReachableUpdateTick: Long = Long.MIN_VALUE,
+        // Ship "gravity" for shipyard fluids is discrete (one of the 6 directions). When it changes due to ship
+        // rotation, vanilla fluids won't tick automatically; schedule a budgeted wave of fluid ticks so they resettle.
+        var lastGravityDownDir: Direction? = null,
+        var pendingGravityResettleNextIdx: Int = -1,
     )
 
     private data class BuoyancyMetrics(
@@ -112,6 +118,7 @@ object ShipWaterPocketManager {
     private val tmpShipBlockPos: ThreadLocal<BlockPos.MutableBlockPos> =
         ThreadLocal.withInitial { BlockPos.MutableBlockPos() }
     private val tmpShipFlowDir: ThreadLocal<Vector3d> = ThreadLocal.withInitial { Vector3d() }
+    private val tmpShipGravityVec: ThreadLocal<Vector3d> = ThreadLocal.withInitial { Vector3d() }
 
     private data class ShipFluidSampleCache(
         var lastLevel: Level? = null,
@@ -135,6 +142,40 @@ object ShipWaterPocketManager {
     private val tmpPressureHeapPos: ThreadLocal<IntArray> = ThreadLocal.withInitial { IntArray(0) }
 
     private const val POINT_QUERY_EPS: Double = 1e-5
+
+    private data class BuoyancyFluidProps(
+        val density: Double,
+        val viscosity: Double,
+    )
+
+    private val buoyancyFluidPropsCache: ConcurrentHashMap<Fluid, BuoyancyFluidProps> = ConcurrentHashMap()
+
+    private fun getBuoyancyFluidProps(fluid: Fluid): BuoyancyFluidProps {
+        return buoyancyFluidPropsCache.computeIfAbsent(fluid) { f ->
+            var density = if (f == Fluids.LAVA) 3000.0 else 1000.0
+            var viscosity = if (f == Fluids.LAVA) 6000.0 else 1000.0
+
+            // Forge: prefer FluidType density/viscosity when available (supports modded liquids).
+            try {
+                val getFluidType = f.javaClass.getMethod("getFluidType")
+                val fluidType = getFluidType.invoke(f) ?: return@computeIfAbsent BuoyancyFluidProps(density, viscosity)
+
+                val getDensity = fluidType.javaClass.getMethod("getDensity")
+                val getViscosity = fluidType.javaClass.getMethod("getViscosity")
+
+                val d = (getDensity.invoke(fluidType) as? Int)?.toDouble()
+                val v = (getViscosity.invoke(fluidType) as? Int)?.toDouble()
+                if (d != null && d.isFinite() && d > 0.0) density = d
+                if (v != null && v.isFinite() && v > 0.0) viscosity = v
+            } catch (_: Throwable) {
+                // Non-Forge environment or fluid type missing; keep vanilla-ish defaults.
+            }
+
+            density = density.coerceIn(100.0, 20_000.0)
+            viscosity = viscosity.coerceIn(100.0, 200_000.0)
+            BuoyancyFluidProps(density, viscosity)
+        }
+    }
 
     @JvmStatic
     fun isApplyingInternalUpdates(): Boolean = applyingInternalUpdates
@@ -241,12 +282,25 @@ object ShipWaterPocketManager {
                 }
             }
 
-            val now = level.gameTime
-            val shipTransform = getQueryTransform(ship)
-            if (needsRecompute || now != state.lastWaterReachableUpdateTick) {
-                state.waterReachable = computeWaterReachable(level, state, shipTransform)
-                state.lastWaterReachableUpdateTick = now
-                updateVsBuoyancyFromPockets(ship, state)
+	            val now = level.gameTime
+	            val shipTransform = getQueryTransform(ship)
+
+                // If ship rotation changes the discrete shipyard "down" direction, wake up any fluids that are
+                // sitting still in the shipyard so they can reflow under the new gravity.
+                val gravityDown = computeShipGravityDownDir(shipTransform)
+                val lastGravity = state.lastGravityDownDir
+                if (lastGravity == null) {
+                    state.lastGravityDownDir = gravityDown
+                } else if (lastGravity != gravityDown) {
+                    state.lastGravityDownDir = gravityDown
+                    state.pendingGravityResettleNextIdx = 0
+                }
+                tickGravityResettle(level, state)
+
+	            if (needsRecompute || now != state.lastWaterReachableUpdateTick) {
+	                state.waterReachable = computeWaterReachable(level, state, shipTransform)
+	                state.lastWaterReachableUpdateTick = now
+	                updateVsBuoyancyFromPockets(ship, state)
             }
             cleanupLeakedShipyardWater(level, state)
             if (needsRecompute || now - state.lastFloodUpdateTick >= FLOOD_UPDATE_INTERVAL_TICKS) {
@@ -257,6 +311,74 @@ object ShipWaterPocketManager {
 
         // Cleanup unloaded ships
         states.keys.removeIf { !loadedShipIds.contains(it) }
+	    }
+
+    private fun computeShipGravityDownDir(shipTransform: ShipTransform): Direction {
+        val rot = shipTransform.shipToWorldRotation
+        val v = tmpShipGravityVec.get()
+
+        v.set(0.0, 1.0, 0.0)
+        rot.transform(v)
+        val yY = v.y
+
+        v.set(1.0, 0.0, 0.0)
+        rot.transform(v)
+        val yX = v.y
+
+        v.set(0.0, 0.0, 1.0)
+        rot.transform(v)
+        val yZ = v.y
+
+        var best = Direction.DOWN
+        var bestY = -yY // local -Y
+
+        if (yY < bestY) {
+            bestY = yY
+            best = Direction.UP
+        }
+        if (yX < bestY) {
+            bestY = yX
+            best = Direction.EAST
+        }
+        if (-yX < bestY) {
+            bestY = -yX
+            best = Direction.WEST
+        }
+        if (yZ < bestY) {
+            bestY = yZ
+            best = Direction.SOUTH
+        }
+        if (-yZ < bestY) {
+            best = Direction.NORTH
+        }
+
+        return best
+    }
+
+    private fun tickGravityResettle(level: ServerLevel, state: ShipPocketState) {
+        val nextIdx = state.pendingGravityResettleNextIdx
+        if (nextIdx < 0) return
+
+        val fluidBlocks = state.materializedWater
+        if (fluidBlocks.isEmpty) {
+            state.pendingGravityResettleNextIdx = -1
+            return
+        }
+
+        val pos = BlockPos.MutableBlockPos()
+        var idx = fluidBlocks.nextSetBit(nextIdx)
+        var scheduled = 0
+        while (idx >= 0 && scheduled < GRAVITY_RESETTLE_MAX_SCHEDULED_TICKS_PER_SHIP_PER_TICK) {
+            posFromIndex(state, idx, pos)
+            val fs = level.getFluidState(pos)
+            if (!fs.isEmpty) {
+                level.scheduleTick(pos, fs.type, 1)
+                scheduled++
+            }
+            idx = fluidBlocks.nextSetBit(idx + 1)
+        }
+
+        state.pendingGravityResettleNextIdx = idx
     }
 
     private fun cleanupLeakedShipyardWater(level: ServerLevel, state: ShipPocketState) {
@@ -275,6 +397,10 @@ object ShipWaterPocketManager {
         val serverShip = ship as? LoadedServerShip ?: return
         val buoyancyHandler = serverShip.getAttachment(BuoyancyHandlerAttachment::class.java) ?: return
         val buoyancyDuck = buoyancyHandler as? ValkyrienAirBuoyancyAttachmentDuck
+
+        val props = getBuoyancyFluidProps(state.floodFluid)
+        buoyancyDuck?.`valkyrienair$setBuoyancyFluidDensity`(props.density)
+        buoyancyDuck?.`valkyrienair$setBuoyancyFluidViscosity`(props.viscosity)
 
         // The additional buoyant force from pockets is just the volume of *submerged interior air* that is currently
         // not flooded (i.e. displacing world water).

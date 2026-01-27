@@ -33,6 +33,7 @@ import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.resources.ResourceLocation;
 import net.minecraft.util.Mth;
 import net.minecraft.world.inventory.InventoryMenu;
+import net.minecraft.world.level.BlockAndTintGetter;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FluidState;
@@ -87,6 +88,9 @@ public final class ShipWaterPocketExternalWaterCull {
     private static final ResourceLocation WATER_STILL = new ResourceLocation("minecraft", "block/water_still");
     private static final ResourceLocation WATER_FLOW = new ResourceLocation("minecraft", "block/water_flow");
     private static final ResourceLocation WATER_OVERLAY = new ResourceLocation("minecraft", "block/water_overlay");
+
+    private static final ResourceLocation LAVA_STILL = new ResourceLocation("minecraft", "block/lava_still");
+    private static final ResourceLocation LAVA_FLOW = new ResourceLocation("minecraft", "block/lava_flow");
 
     private static int fluidMaskTexId = 0;
     private static int fluidMaskWidth = 0;
@@ -1174,16 +1178,17 @@ public final class ShipWaterPocketExternalWaterCull {
         final Function<ResourceLocation, TextureAtlasSprite> atlas = mc.getTextureAtlas(InventoryMenu.BLOCK_ATLAS);
         final List<TextureAtlasSprite> sprites = new ArrayList<>();
 
-        final boolean collected =
-            collectFluidSpritesForge(atlas, sprites) ||
-                collectFluidSpritesFabric(level, sprites);
+        // Best-effort: gather all fluid sprites (modded + vanilla). Never hard-fail the whole mask because one fluid is
+        // broken; per-fluid failures are ignored.
+        collectFluidSpritesForge(level, atlas, sprites);
+        collectFluidSpritesFabric(level, sprites);
 
-        if (!collected) {
-            // Fallback: at least cover vanilla water so we don't mis-cull random translucent textures.
-            sprites.add(atlas.apply(WATER_STILL));
-            sprites.add(atlas.apply(WATER_FLOW));
-            sprites.add(atlas.apply(WATER_OVERLAY));
-        }
+        // Always include vanilla fluids so culling still works even if modded sprite discovery fails.
+        sprites.add(atlas.apply(WATER_STILL));
+        sprites.add(atlas.apply(WATER_FLOW));
+        sprites.add(atlas.apply(WATER_OVERLAY));
+        sprites.add(atlas.apply(LAVA_STILL));
+        sprites.add(atlas.apply(LAVA_FLOW));
 
         final Set<ResourceLocation> seenSprites = new HashSet<>();
         for (final TextureAtlasSprite sprite : sprites) {
@@ -1217,27 +1222,39 @@ public final class ShipWaterPocketExternalWaterCull {
         return fluidMaskTexId;
     }
 
-    private static boolean collectFluidSpritesForge(final Function<ResourceLocation, TextureAtlasSprite> atlas,
+    private static boolean collectFluidSpritesForge(final ClientLevel level, final Function<ResourceLocation, TextureAtlasSprite> atlas,
         final List<TextureAtlasSprite> outSprites) {
         try {
             final Class<?> extClass = Class.forName("net.minecraftforge.client.extensions.common.IClientFluidTypeExtensions");
             final Method of = extClass.getMethod("of", Fluid.class);
-            final Method getStill = extClass.getMethod("getStillTexture");
-            final Method getFlow = extClass.getMethod("getFlowingTexture");
-            final Method getOverlay = extClass.getMethod("getOverlayTexture");
+
+            final Method getStill0 = findMethod(extClass, "getStillTexture");
+            final Method getFlow0 = findMethod(extClass, "getFlowingTexture");
+            final Method getOverlay0 = findMethod(extClass, "getOverlayTexture");
+
+            final Method getStill3 = findMethod(extClass, "getStillTexture", FluidState.class, BlockAndTintGetter.class, BlockPos.class);
+            final Method getFlow3 = findMethod(extClass, "getFlowingTexture", FluidState.class, BlockAndTintGetter.class, BlockPos.class);
+            final Method getOverlay3 = findMethod(extClass, "getOverlayTexture", FluidState.class, BlockAndTintGetter.class, BlockPos.class);
 
             final Set<ResourceLocation> textureIds = new HashSet<>();
             for (final Fluid fluid : BuiltInRegistries.FLUID) {
-                final Object ext = of.invoke(null, fluid);
-                if (ext == null) continue;
+                try {
+                    final Object ext = of.invoke(null, fluid);
+                    if (ext == null) continue;
 
-                final ResourceLocation still = (ResourceLocation) getStill.invoke(ext);
-                final ResourceLocation flow = (ResourceLocation) getFlow.invoke(ext);
-                final ResourceLocation overlay = (ResourceLocation) getOverlay.invoke(ext);
+                    final FluidState fluidState = fluid.defaultFluidState();
 
-                if (still != null && textureIds.add(still)) outSprites.add(atlas.apply(still));
-                if (flow != null && textureIds.add(flow)) outSprites.add(atlas.apply(flow));
-                if (overlay != null && textureIds.add(overlay)) outSprites.add(atlas.apply(overlay));
+                    final ResourceLocation still = invokeTexture(ext, getStill0, getStill3, fluidState, level);
+                    final ResourceLocation flow = invokeTexture(ext, getFlow0, getFlow3, fluidState, level);
+                    final ResourceLocation overlay = invokeTexture(ext, getOverlay0, getOverlay3, fluidState, level);
+
+                    if (still != null && textureIds.add(still)) outSprites.add(atlas.apply(still));
+                    if (flow != null && textureIds.add(flow)) outSprites.add(atlas.apply(flow));
+                    if (overlay != null && textureIds.add(overlay)) outSprites.add(atlas.apply(overlay));
+                } catch (final Throwable ignored) {
+                    // Some modded fluids can throw from their render properties; ignore per-fluid failures so we still
+                    // build a useful mask.
+                }
             }
 
             return true;
@@ -1268,14 +1285,18 @@ public final class ShipWaterPocketExternalWaterCull {
             );
 
             for (final Fluid fluid : BuiltInRegistries.FLUID) {
-                final Object handler = getHandler.invoke(registry, fluid);
-                if (handler == null) continue;
+                try {
+                    final Object handler = getHandler.invoke(registry, fluid);
+                    if (handler == null) continue;
 
-                final FluidState fluidState = fluid.defaultFluidState();
-                final TextureAtlasSprite[] sprites = (TextureAtlasSprite[]) getSprites.invoke(handler, level, BlockPos.ZERO, fluidState);
-                if (sprites == null) continue;
-                for (final TextureAtlasSprite sprite : sprites) {
-                    if (sprite != null) outSprites.add(sprite);
+                    final FluidState fluidState = fluid.defaultFluidState();
+                    final TextureAtlasSprite[] sprites = (TextureAtlasSprite[]) getSprites.invoke(handler, level, BlockPos.ZERO, fluidState);
+                    if (sprites == null) continue;
+                    for (final TextureAtlasSprite sprite : sprites) {
+                        if (sprite != null) outSprites.add(sprite);
+                    }
+                } catch (final Throwable ignored) {
+                    // Per-fluid handler failures should not break the entire mask.
                 }
             }
 
@@ -1289,6 +1310,29 @@ public final class ShipWaterPocketExternalWaterCull {
             }
             return false;
         }
+    }
+
+    private static Method findMethod(final Class<?> owner, final String name, final Class<?>... params) {
+        try {
+            return owner.getMethod(name, params);
+        } catch (final NoSuchMethodException ignored) {
+            return null;
+        } catch (final Throwable t) {
+            return null;
+        }
+    }
+
+    private static ResourceLocation invokeTexture(final Object ext, final Method noArgs, final Method withState,
+        final FluidState fluidState, final ClientLevel level) throws Exception {
+        if (noArgs != null) {
+            final Object v = noArgs.invoke(ext);
+            if (v instanceof final ResourceLocation rl) return rl;
+        }
+        if (withState != null && level != null) {
+            final Object v = withState.invoke(ext, fluidState, level, BlockPos.ZERO);
+            if (v instanceof final ResourceLocation rl) return rl;
+        }
+        return null;
     }
 
     private static int ensureIntTexture(final int existingId, final int width, final int height) {
