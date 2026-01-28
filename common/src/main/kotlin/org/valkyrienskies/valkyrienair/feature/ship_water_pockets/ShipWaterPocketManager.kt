@@ -52,6 +52,13 @@ object ShipWaterPocketManager {
     private const val MAX_SIM_VOLUME = 2_000_000
     private const val POCKET_BOUNDS_PADDING = 1
     private const val AIR_PRESSURE_Y_EPS = 1e-7
+    private const val AIR_PRESSURE_ATM = 1.0
+    // Minecraft-ish hydrostatic pressure: ~1 atm per 10 blocks of water depth for "water-density" fluids.
+    // Pressure increase per block is `density * AIR_PRESSURE_PER_BLOCK_PER_DENSITY`.
+    private const val AIR_PRESSURE_PER_BLOCK_PER_DENSITY = 1e-4
+    private const val AIR_PRESSURE_SOLVER_ITERS = 4
+    private const val AIR_PRESSURE_MIN_EFFECTIVE_AIR_VOLUME = 0.25
+    private const val AIR_PRESSURE_SURFACE_SCAN_MAX_STEPS = 256
     private const val GRAVITY_RESETTLE_MAX_SCHEDULED_TICKS_PER_SHIP_PER_TICK = 4096
     // Flooding speed: this is an abstract "water plane rise" rate. Bigger/more holes increase the rise rate.
     private const val FLOOD_RISE_PER_TICK_BASE = 0.01
@@ -1488,17 +1495,17 @@ object ShipWaterPocketManager {
         }
     }
 
-    /**
-     * Computes a conservative approximation of ship-interior air space.
-     *
-     * We treat an open voxel as "interior" if it is enclosed by watertight blocks on **both sides** of at least 2 of the
-     * 3 ship axes. This keeps most real rooms interior even when they have openings (doors/holes), while rejecting the
-     * large exterior volume around the ship.
-     *
-     * This heuristic intentionally errs on the side of classifying *less* space as interior to avoid culling/physics
-     * issues in the ocean around the ship.
-     */
-    private fun computeInteriorMask(open: BitSet, sizeX: Int, sizeY: Int, sizeZ: Int): BitSet {
+	    /**
+	     * Computes a conservative approximation of ship-interior air space.
+	     *
+	     * We treat an open voxel as "interior" if it is enclosed by watertight blocks on **both sides** of at least 3 of the
+	     * 5 tested axes (X/Y/Z plus the 2 diagonals in the XZ plane). This keeps most real rooms interior even when they
+	     * have openings (doors/holes), while rejecting the large exterior volume around the ship.
+	     *
+	     * This heuristic intentionally errs on the side of classifying *less* space as interior to avoid culling/physics
+	     * issues in the ocean around the ship.
+	     */
+	    private fun computeInteriorMask(open: BitSet, sizeX: Int, sizeY: Int, sizeZ: Int): BitSet {
         val volumeLong = sizeX.toLong() * sizeY.toLong() * sizeZ.toLong()
         if (volumeLong <= 0L) return BitSet()
         val volume = volumeLong.toInt()
@@ -1508,12 +1515,16 @@ object ShipWaterPocketManager {
         val strideY = sizeX
         val strideZ = sizeX * sizeY
 
-        val negX = BitSet(volume)
-        val posX = BitSet(volume)
-        val negY = BitSet(volume)
-        val posY = BitSet(volume)
-        val negZ = BitSet(volume)
-        val posZ = BitSet(volume)
+	        val negX = BitSet(volume)
+	        val posX = BitSet(volume)
+	        val negY = BitSet(volume)
+	        val posY = BitSet(volume)
+	        val negZ = BitSet(volume)
+	        val posZ = BitSet(volume)
+	        val negXZ = BitSet(volume)
+	        val posXZ = BitSet(volume)
+	        val negXPosZ = BitSet(volume)
+	        val posXNegZ = BitSet(volume)
 
         // X direction (for each Y/Z line).
         for (z in 0 until sizeZ) {
@@ -1566,9 +1577,9 @@ object ShipWaterPocketManager {
             }
         }
 
-        // Z direction (for each X/Y line).
-        for (y in 0 until sizeY) {
-            for (x in 0 until sizeX) {
+	        // Z direction (for each X/Y line).
+	        for (y in 0 until sizeY) {
+	            for (x in 0 until sizeX) {
                 var seenSolid = false
                 var idx = x + strideY * y
                 for (z in 0 until sizeZ) {
@@ -1589,12 +1600,159 @@ object ShipWaterPocketManager {
                     }
                     idx -= strideZ
                 }
-            }
-        }
+	            }
+	        }
 
-        val interior = BitSet(volume)
-        var idx = open.nextSetBit(0)
-        while (idx >= 0 && idx < volume) {
+	        // Diagonal directions in the XZ plane (for each Y slice).
+	        //
+	        // This helps reject thin "bridges"/connectors between separate hull volumes: they can look enclosed on X/Z due
+	        // to solids far away, but are often open on diagonals and should behave like exterior water/air.
+	        val diagInc = 1 + strideZ
+	        val diagDec = 1 - strideZ
+	        val diagDecRev = strideZ - 1
+	        for (y in 0 until sizeY) {
+	            val yBase = strideY * y
+	
+	            // (-X,-Z) / (+X,+Z)
+	            // Scan NW -> SE to mark solids behind along (-X,-Z).
+	            for (startX in 0 until sizeX) {
+	                var x = startX
+	                var z = 0
+	                var idx = yBase + startX
+	                var seenSolid = false
+	                while (x < sizeX && z < sizeZ) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        negXZ.set(idx)
+	                    }
+	                    x++
+	                    z++
+	                    idx += diagInc
+	                }
+	            }
+	            for (startZ in 1 until sizeZ) {
+	                var x = 0
+	                var z = startZ
+	                var idx = yBase + strideZ * startZ
+	                var seenSolid = false
+	                while (x < sizeX && z < sizeZ) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        negXZ.set(idx)
+	                    }
+	                    x++
+	                    z++
+	                    idx += diagInc
+	                }
+	            }
+	            // Scan SE -> NW to mark solids behind along (+X,+Z).
+	            for (startX in 0 until sizeX) {
+	                var x = startX
+	                var z = sizeZ - 1
+	                var idx = yBase + startX + strideZ * (sizeZ - 1)
+	                var seenSolid = false
+	                while (x >= 0 && z >= 0) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        posXZ.set(idx)
+	                    }
+	                    x--
+	                    z--
+	                    idx -= diagInc
+	                }
+	            }
+	            for (startZ in sizeZ - 2 downTo 0) {
+	                var x = sizeX - 1
+	                var z = startZ
+	                var idx = yBase + (sizeX - 1) + strideZ * startZ
+	                var seenSolid = false
+	                while (x >= 0 && z >= 0) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        posXZ.set(idx)
+	                    }
+	                    x--
+	                    z--
+	                    idx -= diagInc
+	                }
+	            }
+	
+	            // (-X,+Z) / (+X,-Z)
+	            // Scan SW -> NE (x++, z--) to mark solids behind along (-X,+Z).
+	            for (startX in 0 until sizeX) {
+	                var x = startX
+	                var z = sizeZ - 1
+	                var idx = yBase + startX + strideZ * (sizeZ - 1)
+	                var seenSolid = false
+	                while (x < sizeX && z >= 0) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        negXPosZ.set(idx)
+	                    }
+	                    x++
+	                    z--
+	                    idx += diagDec
+	                }
+	            }
+	            for (startZ in sizeZ - 2 downTo 0) {
+	                var x = 0
+	                var z = startZ
+	                var idx = yBase + strideZ * startZ
+	                var seenSolid = false
+	                while (x < sizeX && z >= 0) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        negXPosZ.set(idx)
+	                    }
+	                    x++
+	                    z--
+	                    idx += diagDec
+	                }
+	            }
+	            // Scan NE -> SW (x--, z++) to mark solids behind along (+X,-Z).
+	            for (startX in 0 until sizeX) {
+	                var x = startX
+	                var z = 0
+	                var idx = yBase + startX
+	                var seenSolid = false
+	                while (x >= 0 && z < sizeZ) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        posXNegZ.set(idx)
+	                    }
+	                    x--
+	                    z++
+	                    idx += diagDecRev
+	                }
+	            }
+	            for (startZ in 1 until sizeZ) {
+	                var x = sizeX - 1
+	                var z = startZ
+	                var idx = yBase + (sizeX - 1) + strideZ * startZ
+	                var seenSolid = false
+	                while (x >= 0 && z < sizeZ) {
+	                    if (!open.get(idx)) {
+	                        seenSolid = true
+	                    } else if (seenSolid) {
+	                        posXNegZ.set(idx)
+	                    }
+	                    x--
+	                    z++
+	                    idx += diagDecRev
+	                }
+	            }
+	        }
+	
+	        val interior = BitSet(volume)
+	        var idx = open.nextSetBit(0)
+	        while (idx >= 0 && idx < volume) {
             val lx = idx % sizeX
             val t = idx / sizeX
             val ly = t % sizeY
@@ -1606,14 +1764,26 @@ object ShipWaterPocketManager {
                 continue
             }
 
-            var axisPairs = 0
-            if (negX.get(idx) && posX.get(idx)) axisPairs++
-            if (negY.get(idx) && posY.get(idx)) axisPairs++
-            if (negZ.get(idx) && posZ.get(idx)) axisPairs++
+	            val pairX = negX.get(idx) && posX.get(idx)
+	            val pairY = negY.get(idx) && posY.get(idx)
+	            val pairZ = negZ.get(idx) && posZ.get(idx)
+	            val pairDiagA = negXZ.get(idx) && posXZ.get(idx)
+	            val pairDiagB = negXPosZ.get(idx) && posXNegZ.get(idx)
 
-            if (axisPairs >= 2) {
-                interior.set(idx)
-            }
+	            var axisPairs = 0
+	            if (pairX) axisPairs++
+	            if (pairY) axisPairs++
+	            if (pairZ) axisPairs++
+	            if (pairDiagA) axisPairs++
+	            if (pairDiagB) axisPairs++
+
+	            // Open-top spaces are ambiguous: both a real "bowl" interior and an exterior canyon between hull pieces can
+	            // look enclosed on the cardinal axes. To reduce rotation/placement-dependent misclassification (which causes
+	            // inconsistent flooding), require *both* XZ diagonals unless the cell has a true vertical enclosure (Y pair).
+	            val diagPairs = (if (pairDiagA) 1 else 0) + (if (pairDiagB) 1 else 0)
+	            if (axisPairs >= 3 && (pairY || diagPairs == 2)) {
+	                interior.set(idx)
+	            }
 
             idx = open.nextSetBit(idx + 1)
         }
@@ -1670,6 +1840,7 @@ object ShipWaterPocketManager {
         val shipPosTmp = Vector3d()
         val shipBlockPos = BlockPos.MutableBlockPos()
         val worldBlockPos = BlockPos.MutableBlockPos()
+        val worldScanPos = BlockPos.MutableBlockPos()
 
         var firstSubmergedFluid: Fluid? = null
 
@@ -1810,6 +1981,8 @@ object ShipWaterPocketManager {
             var hasAirVent = false
             var waterLevel = Double.NEGATIVE_INFINITY
             var seedCount = 0
+            var bestSurfaceSampleIdx = -1
+            var bestSurfaceSampleY = Double.NEGATIVE_INFINITY
 
             fun processHole(curIdx: Int, lx: Int, ly: Int, lz: Int, nIdx: Int) {
                 if (!open.get(nIdx) || interior.get(nIdx)) return
@@ -1818,6 +1991,14 @@ object ShipWaterPocketManager {
                     // Submerged hull opening: water can enter. Track the highest submerged opening as the fill level.
                     waterLevel = maxOf(waterLevel, cellMaxWorldY(lx, ly, lz))
                     waterQueue[seedCount++] = curIdx
+
+                    // Representative "near-surface" sample point for estimating exterior water pressure.
+                    // (Choosing the highest submerged opening tends to reduce the scan distance to the fluid surface.)
+                    val sampleY = cellCenterWorldY(lx, ly, lz)
+                    if (sampleY > bestSurfaceSampleY) {
+                        bestSurfaceSampleY = sampleY
+                        bestSurfaceSampleIdx = curIdx
+                    }
                 } else {
                     // Non-submerged opening to the exterior air: air can escape, so the pocket is unpressurized.
                     hasAirVent = true
@@ -1865,6 +2046,99 @@ object ShipWaterPocketManager {
             }
 
             if (seedCount > 0) {
+                // If the component has no direct vent to outside air, model simple hydrostatic air compression so
+                // sealed pockets can still flood more as they go deeper (and avoid "1-block-short" sideways fills).
+                var pressurizedPlane = waterLevel
+                if (!hasAirVent && bestSurfaceSampleIdx >= 0 && waterLevel.isFinite()) {
+                    val sampleFluidRaw = shipCellSubmergedFluid(bestSurfaceSampleIdx) ?: firstSubmergedFluid
+                    val sampleFluid = if (sampleFluidRaw != null) canonicalFloodSource(sampleFluidRaw) else null
+                    if (sampleFluid != null) {
+                        val surfaceY = withBypassedFluidOverrides {
+                            // Estimate the exterior fluid surface above the sample point by scanning upward in world.
+                            val lx = bestSurfaceSampleIdx % sizeX
+                            val t = bestSurfaceSampleIdx / sizeX
+                            val ly = t % sizeY
+                            val lz = t / sizeY
+
+                            val shipX = (minX + lx).toDouble() + 0.5
+                            val shipY = (minY + ly).toDouble() + 0.5
+                            val shipZ = (minZ + lz).toDouble() + 0.5
+
+                            shipPosTmp.set(shipX, shipY, shipZ)
+                            shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
+
+                            val wx = Mth.floor(worldPosTmp.x)
+                            val wy = Mth.floor(worldPosTmp.y)
+                            val wz = Mth.floor(worldPosTmp.z)
+                            worldScanPos.set(wx, wy, wz)
+
+                            val canonical = canonicalFloodSource(sampleFluid)
+                            var y = worldScanPos.y
+                            var steps = 0
+                            var lastSurface = Double.NEGATIVE_INFINITY
+
+                            while (steps < AIR_PRESSURE_SURFACE_SCAN_MAX_STEPS && y < level.maxBuildHeight) {
+                                val fs = level.getFluidState(worldScanPos)
+                                if (fs.isEmpty || canonicalFloodSource(fs.type) != canonical) break
+
+                                val h = if (fs.isSource) 1.0 else fs.getHeight(level, worldScanPos).toDouble()
+                                lastSurface = y.toDouble() + h
+                                // If we're at the top partial-height block, we've found the surface.
+                                if (h < 1.0 - 1e-6) break
+
+                                worldScanPos.move(0, 1, 0)
+                                y++
+                                steps++
+                            }
+
+                            if (!lastSurface.isFinite()) {
+                                null
+                            } else {
+                                // If we hit the scan cap, fall back to sea level as an upper bound for open water.
+                                if (steps >= AIR_PRESSURE_SURFACE_SCAN_MAX_STEPS) {
+                                    maxOf(lastSurface, (level.seaLevel + 1).toDouble())
+                                } else {
+                                    lastSurface
+                                }
+                            }
+                        }
+
+                        if (surfaceY != null) {
+                            val surfaceYClamped = maxOf(surfaceY, waterLevel)
+                            val density = getBuoyancyFluidProps(sampleFluid).density
+                            var plane = waterLevel
+                            val totalVol = tail.toDouble()
+
+                            repeat(AIR_PRESSURE_SOLVER_ITERS) {
+                                var airCells = 0
+                                for (i in 0 until tail) {
+                                    val cellIdx = componentQueue[i]
+                                    val cx = cellIdx % sizeX
+                                    val ct = cellIdx / sizeX
+                                    val cy = ct % sizeY
+                                    val cz = ct / sizeY
+                                    if (cellCenterWorldY(cx, cy, cz) > plane + AIR_PRESSURE_Y_EPS) {
+                                        airCells++
+                                    }
+                                }
+
+                                val effectiveAirVol =
+                                    maxOf(airCells.toDouble(), AIR_PRESSURE_MIN_EFFECTIVE_AIR_VOLUME)
+                                        .coerceAtMost(totalVol)
+                                val pAir = AIR_PRESSURE_ATM * (totalVol / effectiveAirVol)
+
+                                val planeNew =
+                                    surfaceYClamped - (pAir - AIR_PRESSURE_ATM) / (density * AIR_PRESSURE_PER_BLOCK_PER_DENSITY)
+                                // Damped relaxation: the discrete voxel air-volume function can cause oscillation.
+                                val targetPlane = maxOf(waterLevel, planeNew).coerceAtMost(surfaceYClamped)
+                                plane = plane * 0.5 + targetPlane * 0.5
+                            }
+
+                            pressurizedPlane = plane
+                        }
+                    }
+                }
+
                 var waterHead = 0
                 var waterTail = 0
 
@@ -1878,7 +2152,7 @@ object ShipWaterPocketManager {
                     val ly = t % sizeY
                     val lz = t / sizeY
                     val wy = cellCenterWorldY(lx, ly, lz)
-                    return wy <= waterLevel + planeEps
+                    return wy <= pressurizedPlane + planeEps
                 }
 
                 fun tryEnqueueWater(i: Int) {
@@ -2370,7 +2644,7 @@ object ShipWaterPocketManager {
             var bestVentIdx = -1
             var bestVentOutDirCode = 0
 
-            fun considerVent(holeIdx: Int, outDirCode: Int) {
+            fun considerVent(holeIdx: Int, outDirCode: Int, fromWaterWy: Double) {
                 if (!open.get(holeIdx) || interior.get(holeIdx) || !exteriorOpen.get(holeIdx)) return
                 val lx = holeIdx % sizeX
                 val t = holeIdx / sizeX
@@ -2384,11 +2658,27 @@ object ShipWaterPocketManager {
 
                 // A vent must open into outside *air* (not submerged in world water).
                 if (isShipCellSubmergedInWorldFluid(level, shipTransform, shipBlockPos, shipPosCornerTmp, worldPosCornerTmp, worldBlockPos)) return
+                // ...and must actually open into *air*, not terrain/solid blocks (e.g. when the ship rests on the sea floor).
+                // Otherwise we'd incorrectly "flush" water just because the outside isn't liquid.
+                run {
+                    shipPosCornerTmp.set(shipX.toDouble() + 0.5, shipY.toDouble() + 0.5, shipZ.toDouble() + 0.5)
+                    shipTransform.shipToWorld.transformPosition(shipPosCornerTmp, worldPosCornerTmp)
+                    worldBlockPos.set(
+                        Mth.floor(worldPosCornerTmp.x),
+                        Mth.floor(worldPosCornerTmp.y),
+                        Mth.floor(worldPosCornerTmp.z),
+                    )
+                    if (!level.getBlockState(worldBlockPos).isAir) return
+                }
+
+                // Water can't "flush" out through an opening that's above the draining water cell in world-space.
+                // This fixes bowls/open-top containers losing water upward when moved out of the ocean.
+                val holeWy = cellCenterWorldY(lx, ly, lz)
+                if (holeWy > fromWaterWy + 1.0e-6) return
 
                 drainFaces++
-                val wy = cellCenterWorldY(lx, ly, lz)
-                if (wy < drainTarget) {
-                    drainTarget = wy
+                if (holeWy < drainTarget) {
+                    drainTarget = holeWy
                     bestVentIdx = holeIdx
                     bestVentOutDirCode = outDirCode
                 }
@@ -2406,10 +2696,9 @@ object ShipWaterPocketManager {
                 val ly = t % sizeY
                 val lz = t / sizeY
 
-                if (!hasProtected && materialized.get(idx)) {
-                    val wy = cellCenterWorldY(lx, ly, lz)
-                    if (wy > currentTop) currentTop = wy
-                }
+                val isWaterCell = !hasProtected && materialized.get(idx)
+                val waterWy = if (isWaterCell) cellCenterWorldY(lx, ly, lz) else Double.NaN
+                if (isWaterCell && waterWy > currentTop) currentTop = waterWy
 
                 fun tryNeighbor(n: Int, outDirCode: Int) {
                     if (n < 0 || n >= volume) return
@@ -2419,9 +2708,7 @@ object ShipWaterPocketManager {
                             queue[tail++] = n
                         }
                     } else {
-                        if (!hasProtected) {
-                            considerVent(n, outDirCode)
-                        }
+                        if (isWaterCell) considerVent(n, outDirCode, waterWy)
                     }
                 }
 

@@ -8,6 +8,7 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.material.Fluid;
 import net.minecraft.world.level.material.FlowingFluid;
 import net.minecraft.world.level.material.FluidState;
+import java.util.Iterator;
 import org.joml.Vector3d;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.injection.At;
@@ -27,6 +28,42 @@ public abstract class MixinFlowingFluid {
 
     @org.spongepowered.asm.mixin.Unique
     private static final ThreadLocal<Vector3d> valkyrienair$tmpRotVec = ThreadLocal.withInitial(Vector3d::new);
+
+    @org.spongepowered.asm.mixin.Unique
+    private static final class ValkyrienAirDirIter implements Iterator<Direction> {
+        private final Direction[] dirs;
+        private int idx = 0;
+
+        private ValkyrienAirDirIter(final Direction[] dirs) {
+            this.dirs = dirs;
+        }
+
+        @Override
+        public boolean hasNext() {
+            return idx < dirs.length;
+        }
+
+        @Override
+        public Direction next() {
+            return dirs[idx++];
+        }
+    }
+
+    @org.spongepowered.asm.mixin.Unique
+    private static final Direction[][] valkyrienair$LATERAL_DIRS = new Direction[Direction.values().length][];
+
+    static {
+        for (final Direction down : Direction.values()) {
+            if (down.getAxis() == Direction.Axis.Y) continue;
+            final Direction[] arr = new Direction[4];
+            int j = 0;
+            for (final Direction d : Direction.values()) {
+                if (d == down || d == down.getOpposite()) continue;
+                arr[j++] = d;
+            }
+            valkyrienair$LATERAL_DIRS[down.ordinal()] = arr;
+        }
+    }
 
     @org.spongepowered.asm.mixin.Unique
     private static Direction valkyrienair$getShipGravityDown(final Level level, final BlockPos pos) {
@@ -97,6 +134,15 @@ public abstract class MixinFlowingFluid {
         return best;
     }
 
+    @org.spongepowered.asm.mixin.Unique
+    private static Iterator<Direction> valkyrienair$getLateralIterator(final Direction.Plane plane, final Direction down) {
+        if (down == null) return plane.iterator();
+        if (down.getAxis() == Direction.Axis.Y) return plane.iterator();
+        final Direction[] dirs = valkyrienair$LATERAL_DIRS[down.ordinal()];
+        if (dirs == null) return plane.iterator();
+        return new ValkyrienAirDirIter(dirs);
+    }
+
     @Redirect(
         method = "spread",
         at = @At(value = "INVOKE", target = "Lnet/minecraft/core/BlockPos;below()Lnet/minecraft/core/BlockPos;"),
@@ -116,6 +162,17 @@ public abstract class MixinFlowingFluid {
     private Direction valkyrienair$spreadDownDirection(final Level level, final BlockPos pos, final FluidState state) {
         final Direction down = valkyrienair$getShipGravityDown(level, pos);
         return down != null ? down : Direction.DOWN;
+    }
+
+    @Redirect(
+        method = "spread",
+        at = @At(value = "INVOKE", target = "Lnet/minecraft/core/Direction$Plane;iterator()Ljava/util/Iterator;"),
+        require = 0
+    )
+    private Iterator<Direction> valkyrienair$spreadHorizontalIterator(final Direction.Plane instance, final Level level,
+        final BlockPos pos, final FluidState state) {
+        final Direction down = valkyrienair$getShipGravityDown(level, pos);
+        return valkyrienair$getLateralIterator(instance, down);
     }
 
     @Redirect(
@@ -149,6 +206,17 @@ public abstract class MixinFlowingFluid {
     private Direction valkyrienair$getNewLiquidUpDirection(final Level level, final BlockPos pos, final BlockState state) {
         final Direction down = valkyrienair$getShipGravityDown(level, pos);
         return down != null ? down.getOpposite() : Direction.UP;
+    }
+
+    @Redirect(
+        method = "getNewLiquid",
+        at = @At(value = "INVOKE", target = "Lnet/minecraft/core/Direction$Plane;iterator()Ljava/util/Iterator;"),
+        require = 0
+    )
+    private Iterator<Direction> valkyrienair$getNewLiquidHorizontalIterator(final Direction.Plane instance, final Level level,
+        final BlockPos pos, final BlockState state) {
+        final Direction down = valkyrienair$getShipGravityDown(level, pos);
+        return valkyrienair$getLateralIterator(instance, down);
     }
 
     @Redirect(
@@ -186,5 +254,17 @@ public abstract class MixinFlowingFluid {
         final Direction down = valkyrienair$getShipGravityDown(level, pos);
         if (down == null) return instance.above();
         return instance.move(down.getOpposite());
+    }
+
+    @Redirect(
+        method = "getFlow",
+        at = @At(value = "INVOKE", target = "Lnet/minecraft/core/Direction$Plane;iterator()Ljava/util/Iterator;"),
+        require = 0
+    )
+    private Iterator<Direction> valkyrienair$getFlowHorizontalIterator(final Direction.Plane instance, final BlockGetter getter,
+        final BlockPos pos, final FluidState state) {
+        if (!(getter instanceof final Level level)) return instance.iterator();
+        final Direction down = valkyrienair$getShipGravityDown(level, pos);
+        return valkyrienair$getLateralIterator(instance, down);
     }
 }
