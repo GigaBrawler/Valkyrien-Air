@@ -3,7 +3,12 @@ package org.valkyrienskies.valkyrienair.feature.ship_water_pockets
 import net.minecraft.core.BlockPos
 import net.minecraft.server.level.ServerLevel
 import net.minecraft.world.level.block.Blocks
+import net.minecraft.world.level.block.LiquidBlock
+import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.block.state.properties.BlockStateProperties
 import net.minecraft.world.level.material.Fluid
+import net.minecraft.world.level.material.Fluids
+import net.minecraft.world.level.material.FlowingFluid
 import org.joml.Vector3d
 import org.valkyrienskies.core.api.ships.properties.ShipTransform
 import java.util.BitSet
@@ -12,6 +17,14 @@ internal const val FLOOD_QUEUE_REMOVE_CAP_PER_TICK: Int = 512
 internal const val FLOOD_QUEUE_ADD_CAP_PER_TICK: Int = 512
 
 private const val FLOOD_QUEUE_SETBLOCK_FLAGS: Int = 3 // UPDATE_NEIGHBORS | UPDATE_CLIENTS
+
+private fun canonicalFloodSource(fluid: Fluid): Fluid {
+    return if (fluid is FlowingFluid) fluid.source else fluid
+}
+
+private fun isWaterloggableForFlood(state: BlockState, floodFluid: Fluid): Boolean {
+    return canonicalFloodSource(floodFluid) == Fluids.WATER && state.hasProperty(BlockStateProperties.WATERLOGGED)
+}
 
 internal data class FloodWriteFlushResult(
     val removed: Int,
@@ -101,6 +114,7 @@ internal fun flushFloodWriteQueue(
     val shipPosTmp = Vector3d()
     val worldBlockPos = BlockPos.MutableBlockPos()
     val sourceBlockState = state.floodFluid.defaultFluidState().createLegacyBlock()
+    val floodCanonical = canonicalFloodSource(state.floodFluid)
 
     var removedApplied = 0
     var addedApplied = 0
@@ -116,9 +130,17 @@ internal fun flushFloodWriteQueue(
             posFromIndex(state, idx, pos)
             val current = level.getBlockState(pos)
             val currentFluid = current.fluidState
-            if (!currentFluid.isEmpty && isFloodFluidType(currentFluid.type)) {
+
+            if (current.block is LiquidBlock && !currentFluid.isEmpty && isFloodFluidType(currentFluid.type)) {
                 level.setBlock(pos, Blocks.AIR.defaultBlockState(), FLOOD_QUEUE_SETBLOCK_FLAGS)
                 level.scheduleTick(pos, state.floodFluid, 1)
+                removedApplied++
+            } else if (isWaterloggableForFlood(current, floodCanonical) &&
+                current.getValue(BlockStateProperties.WATERLOGGED)
+            ) {
+                val drained = current.setValue(BlockStateProperties.WATERLOGGED, false)
+                level.setBlock(pos, drained, FLOOD_QUEUE_SETBLOCK_FLAGS)
+                level.scheduleTick(pos, Fluids.WATER, 1)
                 removedApplied++
             }
             state.materializedWater.clear(idx)
@@ -139,10 +161,22 @@ internal fun flushFloodWriteQueue(
                 state.materializedWater.set(idx)
                 return@processQueuedIndices
             }
-            if (!current.isAir) return@processQueuedIndices
 
             val ingressQualified = isIngressQualifiedForAdd(pos, shipTransform, shipPosTmp, worldPosTmp, worldBlockPos)
             if (!ingressQualified) return@processQueuedIndices
+
+            if (!current.isAir) {
+                if (isWaterloggableForFlood(current, floodCanonical)) {
+                    if (!current.getValue(BlockStateProperties.WATERLOGGED)) {
+                        val waterlogged = current.setValue(BlockStateProperties.WATERLOGGED, true)
+                        level.setBlock(pos, waterlogged, FLOOD_QUEUE_SETBLOCK_FLAGS)
+                        level.scheduleTick(pos, Fluids.WATER, 1)
+                        addedApplied++
+                    }
+                    state.materializedWater.set(idx)
+                }
+                return@processQueuedIndices
+            }
 
             level.setBlock(pos, sourceBlockState, FLOOD_QUEUE_SETBLOCK_FLAGS)
             level.scheduleTick(pos, state.floodFluid, 1)

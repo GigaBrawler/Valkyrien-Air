@@ -13,6 +13,7 @@ import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.LiquidBlock
 import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.block.state.properties.BlockStateProperties
 import net.minecraft.world.level.material.Fluid
 import net.minecraft.world.level.material.Fluids
 import net.minecraft.world.level.material.FlowingFluid
@@ -59,13 +60,11 @@ object ShipWaterPocketManager {
     private const val FLOOD_RISE_PER_TICK_BASE = 0.01
     private const val FLOOD_RISE_PER_TICK_PER_HOLE_FACE = 0.00125
     private const val FLOOD_RISE_MAX_PER_TICK = 0.35
-    private const val DRAIN_PER_TICK_BASE = 0.15
-    private const val DRAIN_PER_TICK_PER_HOLE_FACE = 0.003
-    private const val DRAIN_PER_TICK_MAX = 0.85
     private const val FLOOD_ENTER_PLANE_EPS = 1e-4
     private const val FLOOD_EXIT_PLANE_EPS = 3e-4
     private const val SUBMERGED_INGRESS_MIN_COVERAGE = 0.34
     private const val GEOMETRY_ASYNC_SUBMISSIONS_PER_LEVEL_PER_TICK = 2
+    private const val MATERIALIZED_RESYNC_INTERVAL_TICKS = 2L
     @Volatile
     private var applyingInternalUpdates: Boolean = false
 
@@ -528,6 +527,12 @@ object ShipWaterPocketManager {
                 state.lastWaterReachableUpdateTick = now
                 updateVsBuoyancyFromPockets(ship, state)
             }
+            if (state.sizeX > 0 && state.sizeY > 0 && state.sizeZ > 0 &&
+                (geometryApplied || now - state.lastMaterializedResyncTick >= MATERIALIZED_RESYNC_INTERVAL_TICKS)
+            ) {
+                syncMaterializedFloodFluidFromWorld(level, state)
+                state.lastMaterializedResyncTick = now
+            }
             cleanupLeakedShipyardWater(level, state)
             needsRecompute = state.dirty || boundsMismatch(state, minX, minY, minZ, sizeX, sizeY, sizeZ)
             if ((geometryApplied || needsRecompute || now - state.lastFloodUpdateTick >= FLOOD_UPDATE_INTERVAL_TICKS) &&
@@ -661,10 +666,43 @@ object ShipWaterPocketManager {
         val toRemove = tmpLeakedWaterToRemove.get()
         toRemove.clear()
         toRemove.or(state.materializedWater)
-        toRemove.andNot(state.interior)
+        // Only purge cells that are no longer open (e.g. stale writes into solids).
+        // Keep open-cell water managed by the drain solver even if interior classification changes this tick.
+        toRemove.andNot(state.open)
 
         if (toRemove.isEmpty) return
         applyBlockChanges(level, state, toRemove, toWater = false, pos = BlockPos.MutableBlockPos())
+    }
+
+    private fun syncMaterializedFloodFluidFromWorld(level: ServerLevel, state: ShipPocketState) {
+        val open = state.open
+        val volume = state.sizeX * state.sizeY * state.sizeZ
+        if (volume <= 0 || open.isEmpty) {
+            state.materializedWater.clear()
+            return
+        }
+
+        val materialized = state.materializedWater
+        materialized.and(open)
+
+        val pos = BlockPos.MutableBlockPos()
+        var idx = open.nextSetBit(0)
+        while (idx >= 0 && idx < volume) {
+            posFromIndex(state, idx, pos)
+            val current = level.getBlockState(pos)
+            val currentFluid = current.fluidState
+            val hasFloodFluid = !currentFluid.isEmpty && canonicalFloodSource(currentFluid.type) == state.floodFluid
+            if (hasFloodFluid &&
+                (current.block is LiquidBlock ||
+                    (isWaterloggableForFlood(current, state.floodFluid) &&
+                        current.getValue(BlockStateProperties.WATERLOGGED)))
+            ) {
+                materialized.set(idx)
+            } else {
+                materialized.clear(idx)
+            }
+            idx = open.nextSetBit(idx + 1)
+        }
     }
 
     private fun updateVsBuoyancyFromPockets(ship: LoadedShip, state: ShipPocketState) {
@@ -895,6 +933,7 @@ object ShipWaterPocketManager {
         val tangentAWorld = tmpShipGravityVec.get()
         val tangentBWorld = Vector3d()
         val rand = level.random
+        val serverLevel = level as? ServerLevel
 
         shipPosTmp.set(centerShipX, centerShipY, centerShipZ)
         shipTransform.shipToWorld.transformPosition(shipPosTmp, worldPosTmp)
@@ -952,7 +991,11 @@ object ShipWaterPocketManager {
             val vy = jetWorld.y + tangentAWorld.y * su + tangentBWorld.y * sv
             val vz = jetWorld.z + tangentAWorld.z * su + tangentBWorld.z * sv
 
-            level.addParticle(particle, worldPosTmp.x, worldPosTmp.y, worldPosTmp.z, vx, vy, vz)
+            if (serverLevel != null) {
+                serverLevel.sendParticles(particle, worldPosTmp.x, worldPosTmp.y, worldPosTmp.z, 1, vx, vy, vz, 0.0)
+            } else {
+                level.addParticle(particle, worldPosTmp.x, worldPosTmp.y, worldPosTmp.z, vx, vy, vz)
+            }
         }
     }
 
@@ -992,6 +1035,14 @@ object ShipWaterPocketManager {
 
         val open = state.open
         val rand = level.random
+        val shipCellPos = BlockPos.MutableBlockPos()
+
+        fun isCellAlreadyFloodFluid(cellIdx: Int): Boolean {
+            if (cellIdx < 0 || cellIdx >= volume) return false
+            posFromIndex(state, cellIdx, shipCellPos)
+            val cellFluid = level.getFluidState(shipCellPos)
+            return !cellFluid.isEmpty && canonicalFloodSource(cellFluid.type) == state.floodFluid
+        }
 
         val faceDirBuf = IntArray(6)
         val faceConductanceBuf = IntArray(6)
@@ -1019,6 +1070,7 @@ object ShipWaterPocketManager {
             if (cellIdx < 0 || cellIdx >= volume) return false
             if (!interior.get(cellIdx)) return false
             if (!targetWetInterior.get(cellIdx)) return false
+            if (isCellAlreadyFloodFluid(cellIdx)) return false
             if (alreadyChosen(cellIdx)) return false
 
             val lx = cellIdx % sizeX
@@ -1112,12 +1164,13 @@ object ShipWaterPocketManager {
         if (chosenCount == 0) return
 
         val leakParticle = leakParticleForFluid(state.floodFluid)
+        val particleSpeedMultiplier = ValkyrienAirConfig.shipPocketParticleSpeedMultiplier.coerceIn(0.1, 5.0)
         for (iHole in 0 until chosenCount) {
             val holeIdx = chosenHoleIdx[iHole]
             val outDirCode = chosenOutDirCode[iHole]
             val conductance = chosenConductance[iHole].coerceAtLeast(1)
             val particleCount = (3 + conductance / 8).coerceIn(3, 18)
-            val speed = (0.09 + conductance * 0.0004).coerceIn(0.09, 0.22)
+            val speed = ((0.09 + conductance * 0.0004).coerceIn(0.09, 0.22)) * particleSpeedMultiplier
             emitDirectionalLeakParticles(
                 level = level,
                 state = state,
@@ -1128,6 +1181,18 @@ object ShipWaterPocketManager {
                 particle = leakParticle,
                 particleCount = particleCount,
                 baseSpeed = speed,
+            )
+            val outwardCount = (particleCount / 2).coerceIn(1, 9)
+            emitDirectionalLeakParticles(
+                level = level,
+                state = state,
+                shipTransform = shipTransform,
+                cellIdx = holeIdx,
+                faceDirCode = outDirCode,
+                jetDirCode = outDirCode,
+                particle = leakParticle,
+                particleCount = outwardCount,
+                baseSpeed = (speed * 0.9).coerceAtMost(0.3 * particleSpeedMultiplier),
             )
         }
     }
@@ -1555,6 +1620,10 @@ object ShipWaterPocketManager {
 
     private fun canonicalFloodSource(fluid: Fluid): Fluid {
         return if (fluid is FlowingFluid) fluid.source else fluid
+    }
+
+    private fun isWaterloggableForFlood(state: BlockState, floodFluid: Fluid): Boolean {
+        return canonicalFloodSource(floodFluid) == Fluids.WATER && state.hasProperty(BlockStateProperties.WATERLOGGED)
     }
 
     private fun computeWaterReachableWithPressure(
@@ -2288,9 +2357,11 @@ object ShipWaterPocketManager {
                     if (!targetPlane.isFinite()) return
 
                     val oldPlane = if (state.floodPlaneByComponent.containsKey(rep)) state.floodPlaneByComponent.get(rep) else minY
-                    val rise = (FLOOD_RISE_PER_TICK_BASE +
+                    val floodRateMultiplier = ValkyrienAirConfig.shipPocketFloodRateMultiplier
+                        .coerceIn(0.05, 5.0)
+                    val rise = ((FLOOD_RISE_PER_TICK_BASE +
                         submergedHoleFaces.coerceAtLeast(1).toDouble() * FLOOD_RISE_PER_TICK_PER_HOLE_FACE)
-                        .coerceAtMost(FLOOD_RISE_MAX_PER_TICK)
+                        .coerceAtMost(FLOOD_RISE_MAX_PER_TICK)) * floodRateMultiplier
                     val newPlane = minOf(targetPlane, oldPlane + rise)
                     newPlanes.put(rep, newPlane)
 
@@ -2349,7 +2420,7 @@ object ShipWaterPocketManager {
         val open = state.open
         val interior = state.interior
         val materialized = state.materializedWater
-        if (open.isEmpty || interior.isEmpty || materialized.isEmpty) {
+        if (open.isEmpty || materialized.isEmpty) {
             return
         }
 
@@ -2391,7 +2462,7 @@ object ShipWaterPocketManager {
             return baseWorldY + incX * (lx + 0.5) + incY * (ly + 0.5) + incZ * (lz + 0.5)
         }
 
-        fun openingFaceTopWorldY(lx: Int, ly: Int, lz: Int, outDirCode: Int): Double {
+        fun openingFaceMinWorldY(lx: Int, ly: Int, lz: Int, outDirCode: Int): Double {
             val x0 = lx.toDouble()
             val y0 = ly.toDouble()
             val z0 = lz.toDouble()
@@ -2400,12 +2471,12 @@ object ShipWaterPocketManager {
             val z1 = z0 + 1.0
             fun wy(x: Double, y: Double, z: Double): Double = baseWorldY + incX * x + incY * y + incZ * z
             return when (outDirCode) {
-                0 -> maxOf(wy(x0, y0, z0), wy(x0, y1, z0), wy(x0, y0, z1), wy(x0, y1, z1))
-                1 -> maxOf(wy(x1, y0, z0), wy(x1, y1, z0), wy(x1, y0, z1), wy(x1, y1, z1))
-                2 -> maxOf(wy(x0, y0, z0), wy(x1, y0, z0), wy(x0, y0, z1), wy(x1, y0, z1))
-                3 -> maxOf(wy(x0, y1, z0), wy(x1, y1, z0), wy(x0, y1, z1), wy(x1, y1, z1))
-                4 -> maxOf(wy(x0, y0, z0), wy(x1, y0, z0), wy(x0, y1, z0), wy(x1, y1, z0))
-                else -> maxOf(wy(x0, y0, z1), wy(x1, y0, z1), wy(x0, y1, z1), wy(x1, y1, z1))
+                0 -> minOf(wy(x0, y0, z0), wy(x0, y1, z0), wy(x0, y0, z1), wy(x0, y1, z1))
+                1 -> minOf(wy(x1, y0, z0), wy(x1, y1, z0), wy(x1, y0, z1), wy(x1, y1, z1))
+                2 -> minOf(wy(x0, y0, z0), wy(x1, y0, z0), wy(x0, y0, z1), wy(x1, y0, z1))
+                3 -> minOf(wy(x0, y1, z0), wy(x1, y1, z0), wy(x0, y1, z1), wy(x1, y1, z1))
+                4 -> minOf(wy(x0, y0, z0), wy(x1, y0, z0), wy(x0, y1, z0), wy(x1, y1, z0))
+                else -> minOf(wy(x0, y0, z1), wy(x1, y0, z1), wy(x0, y1, z1), wy(x1, y1, z1))
             }
         }
 
@@ -2431,7 +2502,8 @@ object ShipWaterPocketManager {
 
             val particle = leakParticleForFluid(state.floodFluid)
             val particleCount = (2 + conductance / 12).coerceIn(2, 10)
-            val speed = (0.10 + conductance * 0.00035).coerceIn(0.10, 0.18)
+            val particleSpeedMultiplier = ValkyrienAirConfig.shipPocketParticleSpeedMultiplier.coerceIn(0.1, 5.0)
+            val speed = ((0.10 + conductance * 0.00035).coerceIn(0.10, 0.18)) * particleSpeedMultiplier
             emitDirectionalLeakParticles(
                 level = level,
                 state = state,
@@ -2470,11 +2542,16 @@ object ShipWaterPocketManager {
                 conductance: Int,
             ) {
                 if (conductance <= 0) return
-                if (!open.get(holeIdx) || interior.get(holeIdx) || !exteriorOpen.get(holeIdx)) return
+                if (!open.get(holeIdx) || !exteriorOpen.get(holeIdx)) return
                 val lx = holeIdx % sizeX
                 val t = holeIdx / sizeX
                 val ly = t % sizeY
                 val lz = t / sizeY
+                val isBoundaryCell = lx == 0 || lx + 1 == sizeX || ly == 0 || ly + 1 == sizeY || lz == 0 || lz + 1 == sizeZ
+                // Keep vent detection strict to avoid draining through arbitrary interior air cells:
+                // allow exterior-open cells, but if geometry heuristics still classify them as interior,
+                // only accept them when they are on the simulation boundary shell.
+                if (interior.get(holeIdx) && !isBoundaryCell) return
 
                 val shipX = state.minX + lx
                 val shipY = state.minY + ly
@@ -2498,7 +2575,7 @@ object ShipWaterPocketManager {
 
                 // Water can't "flush" out through an opening that's above the draining water cell in world-space.
                 // This fixes bowls/open-top containers losing water upward when moved out of the ocean.
-                val holeWy = openingFaceTopWorldY(waterLX, waterLY, waterLZ, outDirCode)
+                val holeWy = openingFaceMinWorldY(waterLX, waterLY, waterLZ, outDirCode)
                 if (holeWy > fromWaterWy + 1.0e-6) return
 
                 drainFaces += conductance
@@ -2529,13 +2606,13 @@ object ShipWaterPocketManager {
                 fun tryNeighbor(n: Int, outDirCode: Int, conductance: Int) {
                     if (conductance <= 0) return
                     if (n < 0 || n >= volume) return
-                    if (interior.get(n)) {
-                        if (!visited.get(n)) {
-                            visited.set(n)
-                            queue[tail++] = n
-                        }
-                    } else {
-                        if (isWaterCell) considerVent(n, outDirCode, waterWy, lx, ly, lz, conductance)
+                    if (!open.get(n)) return
+                    if (!visited.get(n)) {
+                        visited.set(n)
+                        queue[tail++] = n
+                    }
+                    if (isWaterCell && exteriorOpen.get(n)) {
+                        considerVent(n, outDirCode, waterWy, lx, ly, lz, conductance)
                     }
                 }
 
@@ -2554,9 +2631,11 @@ object ShipWaterPocketManager {
             val oldPlane =
                 if (state.floodPlaneByComponent.containsKey(rep)) state.floodPlaneByComponent.get(rep) else currentTop
 
-            // Drain faster with more exposed faces, capped to keep things stable.
-            val drainRate = (DRAIN_PER_TICK_BASE + drainFaces.toDouble() * DRAIN_PER_TICK_PER_HOLE_FACE)
-                .coerceAtMost(DRAIN_PER_TICK_MAX)
+            // Draining speed matches flooding speed profile (same conductance scaling + same config multiplier).
+            val floodRateMultiplier = ValkyrienAirConfig.shipPocketFloodRateMultiplier.coerceIn(0.05, 5.0)
+            val drainRate = ((FLOOD_RISE_PER_TICK_BASE +
+                drainFaces.toDouble() * FLOOD_RISE_PER_TICK_PER_HOLE_FACE)
+                .coerceAtMost(FLOOD_RISE_MAX_PER_TICK)) * floodRateMultiplier
             val newPlane = maxOf(drainTarget, oldPlane - drainRate)
             newPlanesOut.put(rep, newPlane)
 
@@ -2581,7 +2660,7 @@ object ShipWaterPocketManager {
 
         var start = materialized.nextSetBit(0)
         while (start >= 0 && start < volume) {
-            if (!interior.get(start) || visited.get(start)) {
+            if (!open.get(start) || visited.get(start)) {
                 start = materialized.nextSetBit(start + 1)
                 continue
             }
@@ -2712,29 +2791,51 @@ object ShipWaterPocketManager {
 
                 val current = level.getBlockState(pos)
                 if (toWater) {
-                    if (current.isAir) {
-                        if (shipTransform != null) {
-                            val submergedSample = getShipCellFluidCoverage(
-                                level,
-                                shipTransform,
-                                pos,
-                                shipPosTmp,
-                                worldPosTmp,
-                                worldBlockPos
-                            )
-                            val submergedFluid = submergedSample.canonicalFluid
-                            if (!submergedSample.isIngressQualified() || submergedFluid == null || canonicalFloodSource(submergedFluid) != state.floodFluid) {
-                                idx = indices.nextSetBit(idx + 1)
-                                continue
-                            }
+                    if (shipTransform != null) {
+                        val submergedSample = getShipCellFluidCoverage(
+                            level,
+                            shipTransform,
+                            pos,
+                            shipPosTmp,
+                            worldPosTmp,
+                            worldBlockPos
+                        )
+                        val submergedFluid = submergedSample.canonicalFluid
+                        if (!submergedSample.isIngressQualified() || submergedFluid == null || canonicalFloodSource(submergedFluid) != state.floodFluid) {
+                            idx = indices.nextSetBit(idx + 1)
+                            continue
                         }
+                    }
+
+                    val currentFluid = current.fluidState
+                    if (!currentFluid.isEmpty && canonicalFloodSource(currentFluid.type) == state.floodFluid) {
+                        state.materializedWater.set(idx)
+                    } else if (current.isAir) {
                         level.setBlock(pos, sourceBlockState, flags)
+                        state.materializedWater.set(idx)
+                    } else if (isWaterloggableForFlood(current, state.floodFluid)) {
+                        if (!current.getValue(BlockStateProperties.WATERLOGGED)) {
+                            level.setBlock(pos, current.setValue(BlockStateProperties.WATERLOGGED, true), flags)
+                            level.scheduleTick(pos, Fluids.WATER, 1)
+                        }
                         state.materializedWater.set(idx)
                     }
                 } else {
                     val currentFluid = current.fluidState
-                    if (!currentFluid.isEmpty && canonicalFloodSource(currentFluid.type) == state.floodFluid) {
+                    if (current.block is LiquidBlock &&
+                        !currentFluid.isEmpty &&
+                        canonicalFloodSource(currentFluid.type) == state.floodFluid
+                    ) {
                         level.setBlock(pos, Blocks.AIR.defaultBlockState(), flags)
+                        level.scheduleTick(pos, state.floodFluid, 1)
+                        state.materializedWater.clear(idx)
+                    } else if (isWaterloggableForFlood(current, state.floodFluid) &&
+                        current.getValue(BlockStateProperties.WATERLOGGED)
+                    ) {
+                        level.setBlock(pos, current.setValue(BlockStateProperties.WATERLOGGED, false), flags)
+                        level.scheduleTick(pos, Fluids.WATER, 1)
+                        state.materializedWater.clear(idx)
+                    } else {
                         state.materializedWater.clear(idx)
                     }
                 }

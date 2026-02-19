@@ -4,7 +4,10 @@ import dev.architectury.platform.forge.EventBuses
 import net.minecraft.world.item.BlockItem
 import net.minecraft.world.item.Item
 import net.minecraft.world.level.block.Block
+import net.minecraftforge.fml.ModLoadingContext
 import net.minecraftforge.fml.common.Mod
+import net.minecraftforge.fml.config.ModConfig
+import net.minecraftforge.fml.event.config.ModConfigEvent
 import net.minecraftforge.fml.event.lifecycle.FMLCommonSetupEvent
 import net.minecraftforge.fml.javafmlmod.FMLJavaModLoadingContext
 import net.minecraftforge.fml.loading.FMLEnvironment
@@ -32,7 +35,12 @@ class ValkyrienAirModForge {
         // Submit our event bus to let Architectury API register our content on the right time.
         EventBuses.registerModEventBus(ValkyrienAirMod.MOD_ID, modEventBus)
 
+        ModLoadingContext.get().registerConfig(ModConfig.Type.COMMON, ValkyrienAirForgeConfig.spec)
+        ValkyrienAirForgeConfig.applyToCommonConfig()
+
         modEventBus.addListener(::init)
+        modEventBus.addListener(this::onConfigLoading)
+        modEventBus.addListener(this::onConfigReloading)
         if (FMLEnvironment.dist.isClient) {
             modEventBus.addListener(ValkyrienAirModForgeClient.Companion::clientInit)
         }
@@ -46,6 +54,14 @@ class ValkyrienAirModForge {
         val blockRegistry = BLOCKS.register(registryName, blockSupplier)
         ITEMS.register(registryName) { BlockItem(blockRegistry.get(), Item.Properties()) }
         return blockRegistry
+    }
+
+    private fun onConfigLoading(event: ModConfigEvent.Loading) {
+        ValkyrienAirForgeConfig.onConfigLoading(event)
+    }
+
+    private fun onConfigReloading(event: ModConfigEvent.Reloading) {
+        ValkyrienAirForgeConfig.onConfigReloading(event)
     }
 
     companion object {

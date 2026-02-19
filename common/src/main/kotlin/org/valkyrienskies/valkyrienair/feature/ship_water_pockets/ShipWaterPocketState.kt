@@ -43,6 +43,7 @@ internal data class ShipPocketState(
     var dirty: Boolean = true,
     var lastFloodUpdateTick: Long = Long.MIN_VALUE,
     var lastWaterReachableUpdateTick: Long = Long.MIN_VALUE,
+    var lastMaterializedResyncTick: Long = Long.MIN_VALUE,
     // Ship "gravity" for shipyard fluids is discrete (one of the 6 directions). When it changes due to ship
     // rotation, vanilla fluids won't tick automatically; schedule a budgeted wave of fluid ticks so they resettle.
     var lastGravityDownDir: Direction? = null,

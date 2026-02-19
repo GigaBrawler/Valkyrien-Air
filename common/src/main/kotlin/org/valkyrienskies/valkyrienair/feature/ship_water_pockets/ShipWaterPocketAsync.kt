@@ -5,8 +5,10 @@ import net.minecraft.world.level.Level
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.LiquidBlock
 import net.minecraft.world.level.block.state.BlockState
+import net.minecraft.world.level.block.state.properties.BlockStateProperties
 import net.minecraft.world.level.material.FlowingFluid
 import net.minecraft.world.level.material.Fluid
+import net.minecraft.world.level.material.Fluids
 import java.util.BitSet
 
 internal data class GeometryAsyncSnapshot(
@@ -51,6 +53,10 @@ private val EMPTY_GEOMETRY = ShapeWaterGeometry(
 
 private fun canonicalFloodSource(fluid: Fluid): Fluid {
     return if (fluid is FlowingFluid) fluid.source else fluid
+}
+
+private fun isWaterloggableForFlood(state: BlockState, floodFluid: Fluid): Boolean {
+    return canonicalFloodSource(floodFluid) == Fluids.WATER && state.hasProperty(BlockStateProperties.WATERLOGGED)
 }
 
 internal fun captureGeometryAsyncSnapshot(
@@ -126,7 +132,11 @@ internal fun computeGeometryAsync(snapshot: GeometryAsyncSnapshot): GeometryAsyn
                 val fluidState = bs.fluidState
                 if (!fluidState.isEmpty && canonicalFloodSource(fluidState.type) == snapshot.floodFluid) {
                     flooded.set(idx)
-                    if (bs.block is LiquidBlock) {
+                    if (
+                        bs.block is LiquidBlock ||
+                        (isWaterloggableForFlood(bs, snapshot.floodFluid) &&
+                            bs.getValue(BlockStateProperties.WATERLOGGED))
+                    ) {
                         materialized.set(idx)
                     }
                 }
