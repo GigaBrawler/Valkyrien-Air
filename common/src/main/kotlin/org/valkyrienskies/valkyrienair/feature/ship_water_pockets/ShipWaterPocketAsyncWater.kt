@@ -60,7 +60,9 @@ internal fun computeWaterSolveAsync(snapshot: WaterSolveSnapshot): WaterSolveRes
     val startNanos = System.nanoTime()
     val out = BitSet(snapshot.sizeX * snapshot.sizeY * snapshot.sizeZ)
     val buoyancy = BuoyancyMetrics()
-    val floodFluidOut = AtomicReference<Fluid?>(snapshot.floodFluid)
+    // Start unset so the solver can publish the dominant submerged canonical fluid for this tick.
+    // If no fluid is detected, keep the previous flood fluid to avoid unnecessary churn.
+    val floodFluidOut = AtomicReference<Fluid?>(null)
 
     ShipWaterPocketManager.computeWaterReachableWithPressurePrepared(
         snapshot = snapshot,
@@ -81,7 +83,7 @@ internal fun computeWaterSolveAsync(snapshot: WaterSolveSnapshot): WaterSolveRes
         waterReachable = out,
         unreachableVoid = unreachable,
         buoyancy = buoyancy,
-        floodFluid = floodFluidOut.get(),
+        floodFluid = floodFluidOut.get() ?: snapshot.floodFluid,
         computeNanos = computeNanos,
     )
 }
