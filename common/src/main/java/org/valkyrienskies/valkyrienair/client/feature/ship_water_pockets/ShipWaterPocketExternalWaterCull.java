@@ -21,6 +21,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
+import java.util.concurrent.CompletableFuture;
 import net.minecraft.client.Camera;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientLevel;
@@ -54,6 +56,9 @@ import org.valkyrienskies.core.api.ships.ClientShip;
 import org.valkyrienskies.core.api.ships.LoadedShip;
 import org.valkyrienskies.core.api.ships.properties.ShipTransform;
 import org.valkyrienskies.valkyrienair.config.ValkyrienAirConfig;
+import org.valkyrienskies.valkyrienair.feature.ship_water_pockets.ShipPocketAsyncRuntime;
+import org.valkyrienskies.valkyrienair.feature.ship_water_pockets.ShipPocketAsyncSubsystem;
+import org.valkyrienskies.valkyrienair.feature.ship_water_pockets.ShipWaterPocketAsyncCull;
 import org.valkyrienskies.valkyrienair.feature.ship_water_pockets.ShipWaterPocketManager;
 import org.valkyrienskies.mod.common.VSGameUtilsKt;
 
@@ -99,6 +104,10 @@ public final class ShipWaterPocketExternalWaterCull {
     private static byte[] fluidMaskData = null;
     private static ByteBuffer fluidMaskBuffer = null;
     private static boolean loggedFluidMaskBuildFailed = false;
+    private static CompletableFuture<byte[]> pendingFluidMaskFuture = null;
+    private static int pendingFluidMaskAtlasTexId = 0;
+    private static int pendingFluidMaskWidth = 0;
+    private static int pendingFluidMaskHeight = 0;
 
     private static boolean forgeFluidTexturesChecked = false;
     private static Method forgeFluidExtOf = null;
@@ -140,15 +149,27 @@ public final class ShipWaterPocketExternalWaterCull {
 
         private int[] occData;
         private IntBuffer occBuffer;
+        private CompletableFuture<int[]> pendingOccWordsFuture;
+        private long pendingOccBuildRevision = Long.MIN_VALUE;
 
         private int[] airData;
         private IntBuffer airBuffer;
+        private CompletableFuture<int[]> pendingAirWordsFuture;
+        private long pendingAirBuildKey = Long.MIN_VALUE;
 
         private ShipMasks(final long shipId) {
             this.shipId = shipId;
         }
 
         private void close() {
+            if (pendingOccWordsFuture != null) {
+                pendingOccWordsFuture.cancel(true);
+                pendingOccWordsFuture = null;
+            }
+            if (pendingAirWordsFuture != null) {
+                pendingAirWordsFuture.cancel(true);
+                pendingAirWordsFuture = null;
+            }
             if (occTexId != 0) {
                 TextureUtil.releaseTextureId(occTexId);
                 occTexId = 0;
@@ -248,12 +269,19 @@ public final class ShipWaterPocketExternalWaterCull {
             TextureUtil.releaseTextureId(fluidMaskTexId);
             fluidMaskTexId = 0;
         }
+        if (pendingFluidMaskFuture != null) {
+            pendingFluidMaskFuture.cancel(true);
+            pendingFluidMaskFuture = null;
+        }
         fluidMaskWidth = 0;
         fluidMaskHeight = 0;
         fluidMaskLastAtlasTexId = 0;
         fluidMaskData = null;
         fluidMaskBuffer = null;
         loggedFluidMaskBuildFailed = false;
+        pendingFluidMaskAtlasTexId = 0;
+        pendingFluidMaskWidth = 0;
+        pendingFluidMaskHeight = 0;
 
         lastLevel = null;
     }
@@ -795,6 +823,7 @@ public final class ShipWaterPocketExternalWaterCull {
             if (boundsChanged || masks.geometryRevision != geometryRevision) {
                 rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
             }
+            applyPendingOccMaskBuild(masks);
 
             final ShipTransform shipTransform = getShipTransform(ship);
             final Matrix4dc worldToShip = shipTransform.getWorldToShip();
@@ -904,6 +933,7 @@ public final class ShipWaterPocketExternalWaterCull {
             if (boundsChanged || masks.geometryRevision != geometryRevision) {
                 rebuildOccMask(level, masks, minX, minY, minZ, sizeX, sizeY, sizeZ, geometryRevision);
             }
+            applyPendingOccMaskBuild(masks);
 
             final ShipTransform shipTransform = getShipTransform(ship);
             final Matrix4dc worldToShip = shipTransform.getWorldToShip();
@@ -1063,6 +1093,47 @@ public final class ShipWaterPocketExternalWaterCull {
         masks.sizeZ = sizeZ;
 
         final int volume = sizeX * sizeY * sizeZ;
+        ensureOccTextureStorage(masks, volume);
+
+        final VoxelShape[] shapeSnapshot = new VoxelShape[volume];
+        final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        int idx = 0;
+        for (int lz = 0; lz < sizeZ; lz++) {
+            for (int ly = 0; ly < sizeY; ly++) {
+                for (int lx = 0; lx < sizeX; lx++) {
+                    pos.set(minX + lx, minY + ly, minZ + lz);
+                    final BlockState state = level.getBlockState(pos);
+                    VoxelShape shape = state.getOcclusionShape(level, pos);
+                    if (shape.isEmpty()) {
+                        shape = state.getCollisionShape(level, pos);
+                    }
+                    shapeSnapshot[idx++] = shape;
+                }
+            }
+        }
+
+        final Supplier<int[]> task =
+            () -> ShipWaterPocketAsyncCull.buildOccMaskWords(shapeSnapshot, sizeX, sizeY, sizeZ, SUB);
+
+        final CompletableFuture<int[]> submitted =
+            ShipPocketAsyncRuntime.trySubmitJava(ShipPocketAsyncSubsystem.CLIENT_CULL, task);
+        if (submitted == null) {
+            if (masks.pendingOccWordsFuture != null) {
+                masks.pendingOccWordsFuture.cancel(true);
+                masks.pendingOccWordsFuture = null;
+            }
+            applyOccMaskWords(masks, task.get());
+            return;
+        }
+
+        if (masks.pendingOccWordsFuture != null) {
+            masks.pendingOccWordsFuture.cancel(true);
+        }
+        masks.pendingOccWordsFuture = submitted;
+        masks.pendingOccBuildRevision = geometryRevision;
+    }
+
+    private static void ensureOccTextureStorage(final ShipMasks masks, final int volume) {
         final int wordCount = volume * OCC_WORDS_PER_VOXEL;
         final int height = Math.max(1, (wordCount + MASK_TEX_WIDTH - 1) / MASK_TEX_WIDTH);
 
@@ -1078,57 +1149,41 @@ public final class ShipWaterPocketExternalWaterCull {
             masks.occData = new int[capacity];
             masks.occBuffer = BufferUtils.createIntBuffer(capacity);
         } else {
-            java.util.Arrays.fill(masks.occData, 0);
+            Arrays.fill(masks.occData, 0);
         }
+    }
 
-        final BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+    private static void applyPendingOccMaskBuild(final ShipMasks masks) {
+        final CompletableFuture<int[]> pending = masks.pendingOccWordsFuture;
+        if (pending == null || !pending.isDone()) return;
 
-        for (int lz = 0; lz < sizeZ; lz++) {
-            for (int ly = 0; ly < sizeY; ly++) {
-                for (int lx = 0; lx < sizeX; lx++) {
-                    pos.set(minX + lx, minY + ly, minZ + lz);
-                    final BlockState state = level.getBlockState(pos);
+        final long uploadRevision = masks.pendingOccBuildRevision;
+        masks.pendingOccWordsFuture = null;
+        if (uploadRevision != masks.geometryRevision) return;
+        final int[] words;
+        try {
+            words = pending.join();
+        } catch (final Throwable ignored) {
+            return;
+        }
+        applyOccMaskWords(masks, words);
+    }
 
-                    VoxelShape shape = state.getOcclusionShape(level, pos);
-                    if (shape.isEmpty()) {
-                        shape = state.getCollisionShape(level, pos);
-                        if (shape.isEmpty()) continue;
-                    }
+    private static void applyOccMaskWords(final ShipMasks masks, final int[] words) {
+        if (masks.occTexId == 0 || masks.occBuffer == null || masks.occData == null) return;
+        Arrays.fill(masks.occData, 0);
 
-                    final int voxelIdx = lx + sizeX * (ly + sizeY * lz);
-                    final int wordBase = voxelIdx * OCC_WORDS_PER_VOXEL;
-
-                    shape.toAabbs().forEach(box -> {
-                        final int x0 = Mth.clamp((int) Math.floor(box.minX * SUB), 0, SUB);
-                        final int x1 = Mth.clamp((int) Math.ceil(box.maxX * SUB), 0, SUB);
-                        final int y0 = Mth.clamp((int) Math.floor(box.minY * SUB), 0, SUB);
-                        final int y1 = Mth.clamp((int) Math.ceil(box.maxY * SUB), 0, SUB);
-                        final int z0 = Mth.clamp((int) Math.floor(box.minZ * SUB), 0, SUB);
-                        final int z1 = Mth.clamp((int) Math.ceil(box.maxZ * SUB), 0, SUB);
-
-                        for (int sz = z0; sz < z1; sz++) {
-                            for (int sy = y0; sy < y1; sy++) {
-                                for (int sx = x0; sx < x1; sx++) {
-                                    final int subIdx = sx + SUB * (sy + SUB * sz);
-                                    final int wordIdx = wordBase + (subIdx >> 5);
-                                    final int bit = subIdx & 31;
-
-                                    final int texWordIdx = wordIdx;
-                                    final int texIdx = (texWordIdx & MASK_TEX_WIDTH_MASK) + (texWordIdx >> MASK_TEX_WIDTH_SHIFT) * MASK_TEX_WIDTH;
-                                    if (texIdx < 0 || texIdx >= masks.occData.length) continue;
-                                    masks.occData[texIdx] |= (1 << bit);
-                                }
-                            }
-                        }
-                    });
-                }
-            }
+        final int maxWords = Math.min(words.length, masks.occData.length);
+        for (int wordIdx = 0; wordIdx < maxWords; wordIdx++) {
+            final int texIdx =
+                (wordIdx & MASK_TEX_WIDTH_MASK) + (wordIdx >> MASK_TEX_WIDTH_SHIFT) * MASK_TEX_WIDTH;
+            if (texIdx < 0 || texIdx >= masks.occData.length) continue;
+            masks.occData[texIdx] = words[wordIdx];
         }
 
         masks.occBuffer.clear();
         masks.occBuffer.put(masks.occData);
         masks.occBuffer.flip();
-
         uploadIntTexture(masks.occTexId, MASK_TEX_WIDTH, masks.occTexHeight, masks.occBuffer);
     }
 
@@ -1191,28 +1246,63 @@ public final class ShipWaterPocketExternalWaterCull {
         masks.airTexHeight = height;
 
         final long interiorKey = snapshot.getGeometryRevision();
+        applyPendingAirMaskBuild(masks, interiorKey);
         if (masks.lastAirUploadKey == interiorKey && masks.airTexId != 0 && masks.airTexHeight == height) return;
-        masks.lastAirUploadKey = interiorKey;
+        if (masks.pendingAirWordsFuture != null && masks.pendingAirBuildKey == interiorKey) return;
 
-        final int capacity = MASK_TEX_WIDTH * height;
+        final BitSet interiorSnapshot = snapshot.getInterior() == null ? new BitSet() : (BitSet) snapshot.getInterior().clone();
+        final Supplier<int[]> task = () -> ShipWaterPocketAsyncCull.buildAirMaskWords(interiorSnapshot, volume);
+        final CompletableFuture<int[]> submitted =
+            ShipPocketAsyncRuntime.trySubmitJava(ShipPocketAsyncSubsystem.CLIENT_CULL, task);
+        if (submitted == null) {
+            if (masks.pendingAirWordsFuture != null) {
+                masks.pendingAirWordsFuture.cancel(true);
+                masks.pendingAirWordsFuture = null;
+            }
+            applyAirMaskWords(masks, task.get(), interiorKey);
+            return;
+        }
+
+        if (masks.pendingAirWordsFuture != null) {
+            masks.pendingAirWordsFuture.cancel(true);
+        }
+        masks.pendingAirWordsFuture = submitted;
+        masks.pendingAirBuildKey = interiorKey;
+    }
+
+    private static void applyPendingAirMaskBuild(final ShipMasks masks, final long currentInteriorKey) {
+        final CompletableFuture<int[]> pending = masks.pendingAirWordsFuture;
+        if (pending == null || !pending.isDone()) return;
+
+        final long uploadKey = masks.pendingAirBuildKey;
+        masks.pendingAirWordsFuture = null;
+        if (uploadKey != currentInteriorKey) return;
+
+        final int[] words;
+        try {
+            words = pending.join();
+        } catch (final Throwable ignored) {
+            return;
+        }
+        applyAirMaskWords(masks, words, uploadKey);
+    }
+
+    private static void applyAirMaskWords(final ShipMasks masks, final int[] words, final long uploadKey) {
+        if (masks.airTexId == 0) return;
+        final int capacity = MASK_TEX_WIDTH * masks.airTexHeight;
         if (masks.airData == null || masks.airData.length != capacity) {
             masks.airData = new int[capacity];
             masks.airBuffer = BufferUtils.createIntBuffer(capacity);
         } else {
-            java.util.Arrays.fill(masks.airData, 0);
+            Arrays.fill(masks.airData, 0);
         }
 
-        final BitSet interior = snapshot.getInterior();
-        if (interior != null) {
-            // Cull world-fluid surfaces inside ship interior volumes (including flooded interiors).
-            for (int idx = interior.nextSetBit(0); idx >= 0; idx = interior.nextSetBit(idx + 1)) {
-                final int wordIdx = idx >> 5;
-                final int bit = idx & 31;
-
-                final int texIdx = (wordIdx & MASK_TEX_WIDTH_MASK) + (wordIdx >> MASK_TEX_WIDTH_SHIFT) * MASK_TEX_WIDTH;
-                if (texIdx < 0 || texIdx >= masks.airData.length) continue;
-                masks.airData[texIdx] |= (1 << bit);
-            }
+        final int maxWords = Math.min(words.length, masks.airData.length);
+        for (int wordIdx = 0; wordIdx < maxWords; wordIdx++) {
+            final int texIdx =
+                (wordIdx & MASK_TEX_WIDTH_MASK) + (wordIdx >> MASK_TEX_WIDTH_SHIFT) * MASK_TEX_WIDTH;
+            if (texIdx < 0 || texIdx >= masks.airData.length) continue;
+            masks.airData[texIdx] = words[wordIdx];
         }
 
         masks.airBuffer.clear();
@@ -1220,6 +1310,7 @@ public final class ShipWaterPocketExternalWaterCull {
         masks.airBuffer.flip();
 
         uploadIntTexture(masks.airTexId, MASK_TEX_WIDTH, masks.airTexHeight, masks.airBuffer);
+        masks.lastAirUploadKey = uploadKey;
     }
 
     private static int ensureFluidMaskTexture(final ClientLevel level) {
@@ -1246,14 +1337,6 @@ public final class ShipWaterPocketExternalWaterCull {
 
         if (atlasWidth <= 0 || atlasHeight <= 0) return 0;
 
-        final boolean needsRebuild =
-            fluidMaskTexId == 0 ||
-                fluidMaskWidth != atlasWidth ||
-                fluidMaskHeight != atlasHeight ||
-                fluidMaskLastAtlasTexId != atlasTexId;
-
-        if (!needsRebuild) return fluidMaskTexId;
-
         if (fluidMaskTexId != 0 && (fluidMaskWidth != atlasWidth || fluidMaskHeight != atlasHeight)) {
             TextureUtil.releaseTextureId(fluidMaskTexId);
             fluidMaskTexId = 0;
@@ -1262,14 +1345,21 @@ public final class ShipWaterPocketExternalWaterCull {
         fluidMaskTexId = ensureByteTexture(fluidMaskTexId, atlasWidth, atlasHeight);
         fluidMaskWidth = atlasWidth;
         fluidMaskHeight = atlasHeight;
-        fluidMaskLastAtlasTexId = atlasTexId;
+        applyPendingFluidMaskBuild(atlasTexId, atlasWidth, atlasHeight);
 
-        final int capacity = atlasWidth * atlasHeight;
-        if (fluidMaskData == null || fluidMaskData.length != capacity) {
-            fluidMaskData = new byte[capacity];
-            fluidMaskBuffer = BufferUtils.createByteBuffer(capacity);
-        } else {
-            Arrays.fill(fluidMaskData, (byte) 0);
+        final boolean needsRebuild =
+            fluidMaskTexId == 0 ||
+                fluidMaskWidth != atlasWidth ||
+                fluidMaskHeight != atlasHeight ||
+                fluidMaskLastAtlasTexId != atlasTexId;
+
+        if (!needsRebuild) return fluidMaskTexId;
+        if (pendingFluidMaskFuture != null &&
+            pendingFluidMaskAtlasTexId == atlasTexId &&
+            pendingFluidMaskWidth == atlasWidth &&
+            pendingFluidMaskHeight == atlasHeight
+        ) {
+            return fluidMaskTexId;
         }
 
         final Function<ResourceLocation, TextureAtlasSprite> atlas = mc.getTextureAtlas(InventoryMenu.BLOCK_ATLAS);
@@ -1307,8 +1397,9 @@ public final class ShipWaterPocketExternalWaterCull {
             }
         }
 
-        // Paint the mask by sprite rectangles in atlas pixel space.
         final HashSet<ResourceLocation> seenSprites = new HashSet<>();
+        final int[] rects = new int[sprites.size() * 4];
+        int rectCount = 0;
         for (final TextureAtlasSprite sprite : sprites) {
             if (sprite == null) continue;
             final ResourceLocation name = sprite.contents().name();
@@ -1326,18 +1417,81 @@ public final class ShipWaterPocketExternalWaterCull {
             final int y1 = Math.min(atlasHeight, y0 + h);
             if (x1 <= x0 || y1 <= y0) continue;
 
-            for (int y = y0; y < y1; y++) {
-                final int rowBase = y * atlasWidth;
-                Arrays.fill(fluidMaskData, rowBase + x0, rowBase + x1, (byte) 0xFF);
-            }
+            final int base = rectCount * 4;
+            rects[base] = x0;
+            rects[base + 1] = y0;
+            rects[base + 2] = x1;
+            rects[base + 3] = y1;
+            rectCount++;
         }
+
+        final int[] rectPayload = Arrays.copyOf(rects, rectCount * 4);
+        final int buildWidth = atlasWidth;
+        final int buildHeight = atlasHeight;
+        final Supplier<byte[]> task =
+            () -> ShipWaterPocketAsyncCull.paintFluidMask(buildWidth, buildHeight, rectPayload);
+        final CompletableFuture<byte[]> submitted =
+            ShipPocketAsyncRuntime.trySubmitJava(ShipPocketAsyncSubsystem.CLIENT_CULL, task);
+        if (submitted == null) {
+            if (pendingFluidMaskFuture != null) {
+                pendingFluidMaskFuture.cancel(true);
+                pendingFluidMaskFuture = null;
+            }
+            applyFluidMaskBytes(task.get(), atlasWidth, atlasHeight, atlasTexId);
+            return fluidMaskTexId;
+        }
+
+        if (pendingFluidMaskFuture != null) {
+            pendingFluidMaskFuture.cancel(true);
+        }
+        pendingFluidMaskFuture = submitted;
+        pendingFluidMaskAtlasTexId = atlasTexId;
+        pendingFluidMaskWidth = atlasWidth;
+        pendingFluidMaskHeight = atlasHeight;
+        return fluidMaskTexId;
+    }
+
+    private static void applyPendingFluidMaskBuild(final int atlasTexId, final int atlasWidth, final int atlasHeight) {
+        if (pendingFluidMaskFuture == null || !pendingFluidMaskFuture.isDone()) return;
+        if (pendingFluidMaskAtlasTexId != atlasTexId ||
+            pendingFluidMaskWidth != atlasWidth ||
+            pendingFluidMaskHeight != atlasHeight
+        ) {
+            pendingFluidMaskFuture = null;
+            return;
+        }
+
+        final byte[] bytes;
+        try {
+            bytes = pendingFluidMaskFuture.join();
+        } catch (final Throwable ignored) {
+            pendingFluidMaskFuture = null;
+            return;
+        }
+        pendingFluidMaskFuture = null;
+        applyFluidMaskBytes(bytes, atlasWidth, atlasHeight, atlasTexId);
+    }
+
+    private static void applyFluidMaskBytes(
+        final byte[] bytes,
+        final int atlasWidth,
+        final int atlasHeight,
+        final int atlasTexId
+    ) {
+        final int capacity = atlasWidth * atlasHeight;
+        if (fluidMaskData == null || fluidMaskData.length != capacity) {
+            fluidMaskData = new byte[capacity];
+            fluidMaskBuffer = BufferUtils.createByteBuffer(capacity);
+        }
+        Arrays.fill(fluidMaskData, (byte) 0);
+        System.arraycopy(bytes, 0, fluidMaskData, 0, Math.min(bytes.length, fluidMaskData.length));
 
         fluidMaskBuffer.clear();
         fluidMaskBuffer.put(fluidMaskData);
         fluidMaskBuffer.flip();
 
         uploadByteTexture(fluidMaskTexId, atlasWidth, atlasHeight, fluidMaskBuffer);
-        return fluidMaskTexId;
+        fluidMaskLastAtlasTexId = atlasTexId;
     }
 
     private static Method findMethod(final Class<?> owner, final String name, final Class<?>... params) {
