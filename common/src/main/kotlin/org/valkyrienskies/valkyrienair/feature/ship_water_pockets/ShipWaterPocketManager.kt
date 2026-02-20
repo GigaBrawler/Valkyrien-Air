@@ -100,6 +100,7 @@ object ShipWaterPocketManager {
 
     private data class ShipFluidSampleCache(
         var lastLevel: Level? = null,
+        var lastTick: Long = Long.MIN_VALUE,
         var lastWorldPosLong: Long = Long.MIN_VALUE,
         var lastConfigEnabled: Boolean = false,
         var computed: Boolean = false,
@@ -303,11 +304,26 @@ object ShipWaterPocketManager {
             return false
         }
 
-        if (oldState.block != newState.block) return true
-
         val oldShape = oldState.getCollisionShape(level, pos)
         val newShape = newState.getCollisionShape(level, pos)
-        return Shapes.joinIsNotEmpty(oldShape, newShape, BooleanOp.NOT_SAME)
+        val collisionChanged = Shapes.joinIsNotEmpty(oldShape, newShape, BooleanOp.NOT_SAME)
+
+        val oldOcclusion = oldState.getOcclusionShape(level, pos)
+        val newOcclusion = newState.getOcclusionShape(level, pos)
+        val occlusionChanged = Shapes.joinIsNotEmpty(oldOcclusion, newOcclusion, BooleanOp.NOT_SAME)
+
+        // Water/waterlog spread updates in shipyard can be very noisy and should not invalidate pocket geometry
+        // unless they actually changed the blocking shape.
+        if (
+            oldState.block is LiquidBlock ||
+            newState.block is LiquidBlock ||
+            oldState.hasProperty(BlockStateProperties.WATERLOGGED) ||
+            newState.hasProperty(BlockStateProperties.WATERLOGGED)
+        ) {
+            if (!collisionChanged && !occlusionChanged) return false
+        }
+
+        return collisionChanged || occlusionChanged
     }
 
     private inline fun <T> withBypassedFluidOverrides(block: () -> T): T {
@@ -3012,13 +3028,21 @@ object ShipWaterPocketManager {
 
     private fun computeShipFluidSample(level: Level, worldBlockPos: BlockPos): ShipFluidSampleCache {
         val cache = tmpShipFluidSampleCache.get()
+        val tick = level.gameTime
         val posLong = worldBlockPos.asLong()
         val enabled = ValkyrienAirConfig.enableShipWaterPockets
-        if (cache.lastLevel === level && cache.lastWorldPosLong == posLong && cache.lastConfigEnabled == enabled && cache.computed) {
+        if (
+            cache.lastLevel === level &&
+            cache.lastTick == tick &&
+            cache.lastWorldPosLong == posLong &&
+            cache.lastConfigEnabled == enabled &&
+            cache.computed
+        ) {
             return cache
         }
 
         cache.lastLevel = level
+        cache.lastTick = tick
         cache.lastWorldPosLong = posLong
         cache.lastConfigEnabled = enabled
         cache.computed = true

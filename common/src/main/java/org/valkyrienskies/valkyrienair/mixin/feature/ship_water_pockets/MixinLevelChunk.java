@@ -12,6 +12,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import org.valkyrienskies.core.api.ships.Ship;
+import org.valkyrienskies.mod.common.VSGameUtilsKt;
 import org.valkyrienskies.valkyrienair.config.ValkyrienAirConfig;
 import org.valkyrienskies.valkyrienair.feature.ship_water_pockets.ShipWaterPocketManager;
 
@@ -31,8 +32,9 @@ public abstract class MixinLevelChunk {
 
         final BlockState previousState = cir.getReturnValue();
         if (previousState == null || previousState.equals(state)) return;
+        if (!VSGameUtilsKt.isBlockInShipyard(level, pos)) return;
 
-        final Ship ship = org.valkyrienskies.mod.common.VSGameUtilsKt.getShipManagingPos(level, pos);
+        final Ship ship = VSGameUtilsKt.getShipManagingPos(level, pos);
         if (ship == null) return;
 
         final boolean geometryDirty = ShipWaterPocketManager.shouldMarkShipGeometryDirtyForBlockChange(
