@@ -24,6 +24,67 @@ private const val POINT_CLASSIFY_EPS = 1e-5
 internal fun indexOf(state: ShipPocketState, lx: Int, ly: Int, lz: Int): Int =
     lx + state.sizeX * (ly + state.sizeY * lz)
 
+internal fun isBoundaryShellIndex(state: ShipPocketState, idx: Int): Boolean {
+    val volume = state.sizeX * state.sizeY * state.sizeZ
+    if (idx !in 0 until volume) return false
+    val sx = state.sizeX
+    val sy = state.sizeY
+    val lx = idx % sx
+    val t = idx / sx
+    val ly = t % sy
+    val lz = t / sy
+    return lx == 0 || lx + 1 == state.sizeX ||
+        ly == 0 || ly + 1 == state.sizeY ||
+        lz == 0 || lz + 1 == state.sizeZ
+}
+
+internal fun shouldPreventExteriorWaterlogging(state: ShipPocketState, idx: Int): Boolean {
+    val volume = state.sizeX * state.sizeY * state.sizeZ
+    if (idx !in 0 until volume) return false
+    if (!state.open.get(idx)) return false
+    // Exterior waterlogging must never come from world-fluid contact. Only the simulated domain is allowed to
+    // waterlog/drain as part of flooding/draining (or manual placement).
+    return !state.simulationDomain.get(idx)
+}
+
+internal fun simulationComponentMaskAt(state: ShipPocketState, idx: Int): Long {
+    if (idx < 0) return 0L
+    if (idx < state.voxelSimulationComponentMask.size) {
+        val direct = state.voxelSimulationComponentMask[idx]
+        if (direct != 0L) return direct
+    }
+
+    val volume = state.sizeX * state.sizeY * state.sizeZ
+    if (idx !in 0 until volume) return 0L
+    if (!state.simulationDomain.get(idx)) return 0L
+
+    val templateIndices = state.templateIndexByVoxel
+    val templates = state.shapeTemplatePalette
+    if (templateIndices.size == volume && templates.isNotEmpty()) {
+        val templateIdx = templateIndices[idx]
+        if (templateIdx in templates.indices) {
+            return fullComponentMask(templates[templateIdx].componentCount)
+        }
+    }
+
+    return -1L
+}
+
+internal fun isClassificationInSimulationDomain(
+    state: ShipPocketState,
+    classification: PointVoidClassification,
+): Boolean {
+    val idx = classification.voxelIndex
+    if (idx < 0) return false
+    if (!state.open.get(idx)) return false
+
+    if (classification.localComponent >= 0) {
+        val simMask = simulationComponentMaskAt(state, idx)
+        return ((simMask ushr classification.localComponent) and 1L) != 0L
+    }
+    return state.simulationDomain.get(idx)
+}
+
 internal fun posFromIndex(state: ShipPocketState, idx: Int, out: BlockPos.MutableBlockPos): BlockPos.MutableBlockPos {
     val sx = state.sizeX
     val sy = state.sizeY
@@ -167,7 +228,7 @@ internal fun classifyShipPoint(
             }
 
             if (state.open.get(idx)) {
-                val fallbackKind = if (state.interior.get(idx)) PointVoidClass.INTERIOR_VOID else PointVoidClass.EXTERIOR_VOID
+                val fallbackKind = if (state.strictInterior.get(idx)) PointVoidClass.INTERIOR_VOID else PointVoidClass.EXTERIOR_VOID
                 return PointVoidClassification(
                     kind = fallbackKind,
                     voxelIndex = idx,
@@ -191,7 +252,7 @@ internal fun classifyShipPoint(
     }
 
     return PointVoidClassification(
-        kind = if (state.interior.get(idx)) PointVoidClass.INTERIOR_VOID else PointVoidClass.EXTERIOR_VOID,
+        kind = if (state.strictInterior.get(idx)) PointVoidClass.INTERIOR_VOID else PointVoidClass.EXTERIOR_VOID,
         voxelIndex = idx,
         voxelX = voxelX,
         voxelY = voxelY,
@@ -248,7 +309,7 @@ internal fun isInterior(state: ShipPocketState, shipPos: BlockPos): Boolean {
     val lz = shipPos.z - state.minZ
     if (lx !in 0 until state.sizeX || ly !in 0 until state.sizeY || lz !in 0 until state.sizeZ) return false
     val idx = indexOf(state, lx, ly, lz)
-    return state.interior.get(idx)
+    return state.strictInterior.get(idx)
 }
 
 internal fun isOpen(state: ShipPocketState, shipPos: BlockPos): Boolean {
@@ -275,5 +336,5 @@ internal fun isWorldFluidSuppressionCell(state: ShipPocketState, shipPos: BlockP
     val lz = shipPos.z - state.minZ
     if (lx !in 0 until state.sizeX || ly !in 0 until state.sizeY || lz !in 0 until state.sizeZ) return false
     val idx = indexOf(state, lx, ly, lz)
-    return state.interior.get(idx) && !state.materializedWater.get(idx)
+    return state.simulationDomain.get(idx) && !state.materializedWater.get(idx)
 }

@@ -2,8 +2,10 @@ package org.valkyrienskies.valkyrienair.feature.ship_water_pockets
 
 import net.minecraft.core.BlockPos
 import net.minecraft.server.level.ServerLevel
+import net.minecraft.world.level.block.BucketPickup
 import net.minecraft.world.level.block.Blocks
 import net.minecraft.world.level.block.LiquidBlock
+import net.minecraft.world.level.block.LiquidBlockContainer
 import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.block.state.properties.BlockStateProperties
 import net.minecraft.world.level.material.Fluid
@@ -26,9 +28,53 @@ private fun isWaterloggableForFlood(state: BlockState, floodFluid: Fluid): Boole
     return canonicalFloodSource(floodFluid) == Fluids.WATER && state.hasProperty(BlockStateProperties.WATERLOGGED)
 }
 
+private fun tryPlaceFluidInContainer(
+    level: ServerLevel,
+    pos: BlockPos.MutableBlockPos,
+    current: BlockState,
+    floodFluid: Fluid,
+): Boolean {
+    val canonical = canonicalFloodSource(floodFluid)
+    val flowing = canonical as? FlowingFluid ?: return false
+    val block = current.block
+    if (block !is LiquidBlockContainer) return false
+    return try {
+        if (!block.canPlaceLiquid(level, pos, current, canonical)) return false
+        if (!block.placeLiquid(level, pos, current, flowing.source.defaultFluidState())) return false
+        level.scheduleTick(pos, canonical, 1)
+        true
+    } catch (_: Throwable) {
+        false
+    }
+}
+
+private fun tryDrainFluidFromContainer(
+    level: ServerLevel,
+    pos: BlockPos.MutableBlockPos,
+    current: BlockState,
+    floodFluid: Fluid,
+): Boolean {
+    val canonical = canonicalFloodSource(floodFluid)
+    val currentFluid = current.fluidState
+    if (currentFluid.isEmpty || canonicalFloodSource(currentFluid.type) != canonical) return false
+    val block = current.block
+    if (block !is BucketPickup) return false
+    return try {
+        val picked = block.pickupBlock(level, pos, current)
+        if (picked.isEmpty) return false
+        level.scheduleTick(pos, canonical, 1)
+        true
+    } catch (_: Throwable) {
+        false
+    }
+}
+
 internal data class FloodWriteFlushResult(
     val removed: Int,
     val added: Int,
+    val rejectedAdds: Int,
+    val blockedExteriorWaterlogs: Int,
+    val addedSampleIndices: IntArray,
     val remainingQueued: Int,
 )
 
@@ -100,13 +146,27 @@ internal fun flushFloodWriteQueue(
     ) -> Boolean,
 ): FloodWriteFlushResult {
     if (state.queuedFloodAdds.isEmpty && state.queuedFloodRemoves.isEmpty) {
-        return FloodWriteFlushResult(removed = 0, added = 0, remainingQueued = 0)
+        return FloodWriteFlushResult(
+            removed = 0,
+            added = 0,
+            rejectedAdds = 0,
+            blockedExteriorWaterlogs = 0,
+            addedSampleIndices = IntArray(0),
+            remainingQueued = 0,
+        )
     }
 
     val volume = state.sizeX * state.sizeY * state.sizeZ
     if (volume <= 0) {
         clearFloodWriteQueues(state)
-        return FloodWriteFlushResult(removed = 0, added = 0, remainingQueued = 0)
+        return FloodWriteFlushResult(
+            removed = 0,
+            added = 0,
+            rejectedAdds = 0,
+            blockedExteriorWaterlogs = 0,
+            addedSampleIndices = IntArray(0),
+            remainingQueued = 0,
+        )
     }
 
     val pos = BlockPos.MutableBlockPos()
@@ -118,6 +178,16 @@ internal fun flushFloodWriteQueue(
 
     var removedApplied = 0
     var addedApplied = 0
+    var rejectedAdds = 0
+    var blockedExteriorWaterlogs = 0
+    val addedSamplesMax = 48
+    val addedSampleIndices = IntArray(addedSamplesMax)
+    var addedSampleCount = 0
+
+    fun recordAddedSample(idx: Int) {
+        if (addedSampleCount >= addedSamplesMax) return
+        addedSampleIndices[addedSampleCount++] = idx
+    }
 
     setApplyingInternalUpdates(true)
     try {
@@ -134,6 +204,8 @@ internal fun flushFloodWriteQueue(
             if (current.block is LiquidBlock && !currentFluid.isEmpty && isFloodFluidType(currentFluid.type)) {
                 level.setBlock(pos, Blocks.AIR.defaultBlockState(), FLOOD_QUEUE_SETBLOCK_FLAGS)
                 level.scheduleTick(pos, state.floodFluid, 1)
+                removedApplied++
+            } else if (tryDrainFluidFromContainer(level, pos, current, floodCanonical)) {
                 removedApplied++
             } else if (isWaterloggableForFlood(current, floodCanonical) &&
                 current.getValue(BlockStateProperties.WATERLOGGED)
@@ -163,9 +235,19 @@ internal fun flushFloodWriteQueue(
             }
 
             val ingressQualified = isIngressQualifiedForAdd(pos, shipTransform, shipPosTmp, worldPosTmp, worldBlockPos)
-            if (!ingressQualified) return@processQueuedIndices
+            if (!ingressQualified) {
+                rejectedAdds++
+                return@processQueuedIndices
+            }
 
             if (!current.isAir) {
+                if (tryPlaceFluidInContainer(level, pos, current, floodCanonical)) {
+                    addedApplied++
+                    state.materializedWater.set(idx)
+                    recordAddedSample(idx)
+                    return@processQueuedIndices
+                }
+
                 if (isWaterloggableForFlood(current, floodCanonical)) {
                     if (!current.getValue(BlockStateProperties.WATERLOGGED)) {
                         val waterlogged = current.setValue(BlockStateProperties.WATERLOGGED, true)
@@ -174,6 +256,7 @@ internal fun flushFloodWriteQueue(
                         addedApplied++
                     }
                     state.materializedWater.set(idx)
+                    recordAddedSample(idx)
                 }
                 return@processQueuedIndices
             }
@@ -182,6 +265,7 @@ internal fun flushFloodWriteQueue(
             level.scheduleTick(pos, state.floodFluid, 1)
             state.materializedWater.set(idx)
             addedApplied++
+            recordAddedSample(idx)
         }
         state.nextQueuedAddIdx = addResult.second
     } finally {
@@ -191,6 +275,9 @@ internal fun flushFloodWriteQueue(
     return FloodWriteFlushResult(
         removed = removedApplied,
         added = addedApplied,
+        rejectedAdds = rejectedAdds,
+        blockedExteriorWaterlogs = blockedExteriorWaterlogs,
+        addedSampleIndices = addedSampleIndices.copyOf(addedSampleCount),
         remainingQueued = state.queuedFloodAdds.cardinality() + state.queuedFloodRemoves.cardinality(),
     )
 }

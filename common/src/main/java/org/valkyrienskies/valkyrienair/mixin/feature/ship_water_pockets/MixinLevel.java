@@ -2,8 +2,10 @@ package org.valkyrienskies.valkyrienair.mixin.feature.ship_water_pockets;
 
 import net.minecraft.core.BlockPos;
 import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.BucketPickup;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.LiquidBlock;
+import net.minecraft.world.level.block.LiquidBlockContainer;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.material.FluidState;
@@ -66,6 +68,20 @@ public abstract class MixinLevel {
         if (ShipWaterPocketManager.isApplyingInternalUpdates()) return;
         if (!VSGameUtilsKt.isBlockInShipyard(level, pos)) return;
 
+        final BlockState existing = level.getBlockState(pos);
+        if (state.hasProperty(BlockStateProperties.WATERLOGGED) &&
+            state.getValue(BlockStateProperties.WATERLOGGED) &&
+            existing.hasProperty(BlockStateProperties.WATERLOGGED) &&
+            !existing.getValue(BlockStateProperties.WATERLOGGED)
+        ) {
+            final Ship ship = VSGameUtilsKt.getShipManagingPos(level, pos);
+            if (ship != null && ShipWaterPocketManager.shouldBlockShipyardWaterPlacement(level, ship.getId(), pos)) {
+                cir.setReturnValue(false);
+                cir.cancel();
+                return;
+            }
+        }
+
         final var fluidState = state.getFluidState();
         if (fluidState.isEmpty()) return;
         if (!(state.getBlock() instanceof LiquidBlock)) return;
@@ -73,9 +89,11 @@ public abstract class MixinLevel {
         // Allow vanilla/modded "fluid-in-block" transitions (e.g. breaking/replacing waterlogged blocks) to convert
         // into a liquid block at the same position. Blocking these makes waterlogged blocks effectively unbreakable
         // while submerged because the replacement liquid setBlock() gets cancelled.
-        final BlockState existing = level.getBlockState(pos);
         final FluidState existingFluid = existing.getFluidState();
         if (!(existing.getBlock() instanceof LiquidBlock) && !existingFluid.isEmpty()) {
+            if (existing.getBlock() instanceof BucketPickup || existing.getBlock() instanceof LiquidBlockContainer) {
+                return;
+            }
             if (!existing.hasProperty(BlockStateProperties.WATERLOGGED) || existing.getValue(BlockStateProperties.WATERLOGGED)) {
                 return;
             }
@@ -149,7 +167,7 @@ public abstract class MixinLevel {
         final FluidState originalFluid = original.getFluidState();
         if (originalFluid.isEmpty()) return;
 
-        if (ShipWaterPocketManager.isWorldPosInShipAirPocket(level, pos)) {
+        if (ShipWaterPocketManager.isWorldPosInShipWorldFluidSuppressionZone(level, pos)) {
             cir.setReturnValue(Blocks.AIR.defaultBlockState());
         }
     }

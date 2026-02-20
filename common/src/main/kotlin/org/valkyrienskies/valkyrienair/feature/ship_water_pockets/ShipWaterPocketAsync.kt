@@ -14,12 +14,20 @@ import java.util.BitSet
 internal data class GeometryAsyncSnapshot(
     val generation: Long,
     val invalidationStamp: Long,
+    val geometrySignature: Long,
     val minX: Int,
     val minY: Int,
     val minZ: Int,
     val sizeX: Int,
     val sizeY: Int,
     val sizeZ: Int,
+    val prevMinX: Int,
+    val prevMinY: Int,
+    val prevMinZ: Int,
+    val prevSizeX: Int,
+    val prevSizeY: Int,
+    val prevSizeZ: Int,
+    val prevSimulationDomain: BitSet,
     val floodFluid: Fluid,
     val blockStates: Array<BlockState>,
     val shapeGeometry: Array<ShapeWaterGeometry>,
@@ -28,6 +36,7 @@ internal data class GeometryAsyncSnapshot(
 internal data class GeometryAsyncResult(
     val generation: Long,
     val invalidationStamp: Long,
+    val geometrySignature: Long,
     val minX: Int,
     val minY: Int,
     val minZ: Int,
@@ -36,9 +45,12 @@ internal data class GeometryAsyncResult(
     val sizeZ: Int,
     val open: BitSet,
     val exterior: BitSet,
+    val strictInterior: BitSet,
+    val simulationDomain: BitSet,
     val interior: BitSet,
     val flooded: BitSet,
     val materializedWater: BitSet,
+    val outsideVoid: BitSet,
     val faceCondXP: ShortArray,
     val faceCondYP: ShortArray,
     val faceCondZP: ShortArray,
@@ -46,6 +58,7 @@ internal data class GeometryAsyncResult(
     val templateIndexByVoxel: IntArray,
     val voxelExteriorComponentMask: LongArray,
     val voxelInteriorComponentMask: LongArray,
+    val voxelSimulationComponentMask: LongArray,
     val componentGraphDegraded: Boolean,
     val computeNanos: Long,
 )
@@ -60,11 +73,38 @@ private fun canonicalFloodSource(fluid: Fluid): Fluid {
     return if (fluid is FlowingFluid) fluid.source else fluid
 }
 
+private fun mixHash64(acc: Long, value: Long): Long {
+    var h = acc xor value
+    h *= -7046029254386353131L
+    h = h xor (h ushr 32)
+    h *= -7046029254386353131L
+    return h xor (h ushr 29)
+}
+
+private fun geometryStateHash(blockState: BlockState, geom: ShapeWaterGeometry, idx: Int): Long {
+    var h = -7046029254386353131L
+    h = mixHash64(h, idx.toLong())
+    h = mixHash64(h, blockState.hashCode().toLong())
+    h = mixHash64(h, if (geom.fullSolid) 0xF00DL else 0x0L)
+    h = mixHash64(h, if (geom.refined) 0xBEEFL else 0x0L)
+    h = mixHash64(h, geom.boxes.size.toLong())
+    for (box in geom.boxes) {
+        h = mixHash64(h, java.lang.Double.doubleToLongBits(box.minX))
+        h = mixHash64(h, java.lang.Double.doubleToLongBits(box.minY))
+        h = mixHash64(h, java.lang.Double.doubleToLongBits(box.minZ))
+        h = mixHash64(h, java.lang.Double.doubleToLongBits(box.maxX))
+        h = mixHash64(h, java.lang.Double.doubleToLongBits(box.maxY))
+        h = mixHash64(h, java.lang.Double.doubleToLongBits(box.maxZ))
+    }
+    return h
+}
+
 private fun isWaterloggableForFlood(state: BlockState, floodFluid: Fluid): Boolean {
     return canonicalFloodSource(floodFluid) == Fluids.WATER && state.hasProperty(BlockStateProperties.WATERLOGGED)
 }
 
 private const val MAX_COMPONENT_GRAPH_NODES = 12_000_000
+private const val MIN_HEURISTIC_PROMOTED_COMPONENT_SIZE = 4
 
 private class ShapeTemplateKey(
     private val fullSolid: Boolean,
@@ -117,11 +157,25 @@ internal fun captureGeometryAsyncSnapshot(
     sizeX: Int,
     sizeY: Int,
     sizeZ: Int,
+    prevMinX: Int,
+    prevMinY: Int,
+    prevMinZ: Int,
+    prevSizeX: Int,
+    prevSizeY: Int,
+    prevSizeZ: Int,
+    prevSimulationDomain: BitSet,
     floodFluid: Fluid,
 ): GeometryAsyncSnapshot {
     val volume = sizeX * sizeY * sizeZ
     val blockStates = Array(volume) { Blocks.AIR.defaultBlockState() }
     val shapeGeometry = Array(volume) { EMPTY_GEOMETRY }
+    var signature = 0x1234_5678_9ABCL
+    signature = mixHash64(signature, sizeX.toLong())
+    signature = mixHash64(signature, sizeY.toLong())
+    signature = mixHash64(signature, sizeZ.toLong())
+    signature = mixHash64(signature, minX.toLong())
+    signature = mixHash64(signature, minY.toLong())
+    signature = mixHash64(signature, minZ.toLong())
 
     val pos = BlockPos.MutableBlockPos()
     var idx = 0
@@ -131,7 +185,9 @@ internal fun captureGeometryAsyncSnapshot(
                 pos.set(minX + x, minY + y, minZ + z)
                 val state = level.getBlockState(pos)
                 blockStates[idx] = state
-                shapeGeometry[idx] = computeShapeWaterGeometry(level, pos, state)
+                val geometry = computeShapeWaterGeometry(level, pos, state)
+                shapeGeometry[idx] = geometry
+                signature = mixHash64(signature, geometryStateHash(state, geometry, idx))
                 idx++
             }
         }
@@ -140,12 +196,20 @@ internal fun captureGeometryAsyncSnapshot(
     return GeometryAsyncSnapshot(
         generation = generation,
         invalidationStamp = invalidationStamp,
+        geometrySignature = signature,
         minX = minX,
         minY = minY,
         minZ = minZ,
         sizeX = sizeX,
         sizeY = sizeY,
         sizeZ = sizeZ,
+        prevMinX = prevMinX,
+        prevMinY = prevMinY,
+        prevMinZ = prevMinZ,
+        prevSizeX = prevSizeX,
+        prevSizeY = prevSizeY,
+        prevSizeZ = prevSizeZ,
+        prevSimulationDomain = prevSimulationDomain,
         floodFluid = floodFluid,
         blockStates = blockStates,
         shapeGeometry = shapeGeometry,
@@ -366,21 +430,107 @@ internal fun computeGeometryAsync(snapshot: GeometryAsyncSnapshot): GeometryAsyn
     }
 
     val exterior = BitSet(volume)
-    val interior = BitSet(volume)
+    val strictInterior = BitSet(volume)
+    val simulationDomain = BitSet(volume)
     val voxelExteriorComponentMask = LongArray(volume)
     val voxelInteriorComponentMask = LongArray(volume)
+    val voxelSimulationComponentMask = LongArray(volume)
 
     if (componentGraphDegraded) {
         val strictExterior = floodFillFromBoundaryGraph(open, sizeX, sizeY, sizeZ) { idxCur, lx, ly, lz, dir ->
             edgeCond(idxCur, lx, ly, lz, dir)
         }
-        val strictInterior = open.clone() as BitSet
-        strictInterior.andNot(strictExterior)
-        val heuristicInterior = computeInteriorMaskHeuristic(open, sizeX, sizeY, sizeZ)
-        heuristicInterior.andNot(strictExterior)
-        strictInterior.or(heuristicInterior)
+        val degradedInterior = open.clone() as BitSet
+        degradedInterior.andNot(strictExterior)
         exterior.or(strictExterior)
-        interior.or(strictInterior)
+        strictInterior.or(degradedInterior)
+        simulationDomain.or(degradedInterior)
+
+        // Add a conductance-based enclosure heuristic so leaky pockets remain simulated even when strict interior
+        // collapses under holes. This intentionally does NOT subtract strictExterior.
+        val enclosedHeuristic = computeEnclosedHeuristicFromGeometry(
+            open = open,
+            sizeX = sizeX,
+            sizeY = sizeY,
+            sizeZ = sizeZ,
+            faceCondXP = faceCondXP,
+            faceCondYP = faceCondYP,
+            faceCondZP = faceCondZP,
+            passCondThreshold = MIN_OPENING_CONDUCTANCE,
+        )
+        val promoted = enclosedHeuristic.clone() as BitSet
+        promoted.andNot(simulationDomain)
+
+        val promotedVisited = BitSet(volume)
+        val promotedQueue = IntArray(volume)
+
+        var startPromoted = promoted.nextSetBit(0)
+        while (startPromoted >= 0 && startPromoted < volume) {
+            if (promotedVisited.get(startPromoted)) {
+                startPromoted = promoted.nextSetBit(startPromoted + 1)
+                continue
+            }
+
+            var head = 0
+            var tail = 0
+            var componentSize = 0
+            var hasNonBoundaryCell = false
+            var touchesAnchoredCell = false
+
+            promotedVisited.set(startPromoted)
+            promotedQueue[tail++] = startPromoted
+
+            fun tryEnqueuePromoted(idx: Int) {
+                if (idx < 0 || idx >= volume) return
+                if (!promoted.get(idx) || promotedVisited.get(idx)) return
+                promotedVisited.set(idx)
+                promotedQueue[tail++] = idx
+            }
+
+            while (head < tail) {
+                val cur = promotedQueue[head++]
+                componentSize++
+
+                val cx = cur % sizeX
+                val ct = cur / sizeX
+                val cy = ct % sizeY
+                val cz = ct / sizeY
+
+                if (cx > 0 && cx + 1 < sizeX &&
+                    cy > 0 && cy + 1 < sizeY &&
+                    cz > 0 && cz + 1 < sizeZ
+                ) {
+                    hasNonBoundaryCell = true
+                }
+
+                if (flooded.get(cur) || materialized.get(cur)) {
+                    touchesAnchoredCell = true
+                }
+
+                if (cx > 0) tryEnqueuePromoted(cur - 1)
+                if (cx + 1 < sizeX) tryEnqueuePromoted(cur + 1)
+                if (cy > 0) tryEnqueuePromoted(cur - strideY)
+                if (cy + 1 < sizeY) tryEnqueuePromoted(cur + strideY)
+                if (cz > 0) tryEnqueuePromoted(cur - strideZ)
+                if (cz + 1 < sizeZ) tryEnqueuePromoted(cur + strideZ)
+            }
+
+            val promoteComponent = touchesAnchoredCell ||
+                (hasNonBoundaryCell && componentSize >= MIN_HEURISTIC_PROMOTED_COMPONENT_SIZE)
+
+            if (promoteComponent) {
+                for (i in 0 until tail) {
+                    val cur = promotedQueue[i]
+                    simulationDomain.set(cur)
+                    if (voxelSimulationComponentMask[cur] == 0L) {
+                        val template = templatePalette[templateIndexByVoxel[cur]]
+                        voxelSimulationComponentMask[cur] = fullComponentMask(template.componentCount)
+                    }
+                }
+            }
+
+            startPromoted = promoted.nextSetBit(startPromoted + 1)
+        }
 
         openIdx = open.nextSetBit(0)
         while (openIdx >= 0 && openIdx < volume) {
@@ -389,8 +539,9 @@ internal fun computeGeometryAsync(snapshot: GeometryAsyncSnapshot): GeometryAsyn
             if (strictExterior.get(openIdx)) {
                 voxelExteriorComponentMask[openIdx] = fullMask
             }
-            if (strictInterior.get(openIdx)) {
+            if (degradedInterior.get(openIdx)) {
                 voxelInteriorComponentMask[openIdx] = fullMask
+                voxelSimulationComponentMask[openIdx] = fullMask
             }
             openIdx = open.nextSetBit(openIdx + 1)
         }
@@ -422,33 +573,181 @@ internal fun computeGeometryAsync(snapshot: GeometryAsyncSnapshot): GeometryAsyn
             voxelExteriorComponentMask[openIdx] = exteriorMask
             voxelInteriorComponentMask[openIdx] = interiorMask
             if (exteriorMask != 0L) exterior.set(openIdx)
-            if (interiorMask != 0L) interior.set(openIdx)
+            if (interiorMask != 0L) {
+                strictInterior.set(openIdx)
+                simulationDomain.set(openIdx)
+                voxelSimulationComponentMask[openIdx] = interiorMask
+            }
 
             openIdx = open.nextSetBit(openIdx + 1)
         }
 
-        // Keep legacy enclosure heuristic as a stabilizing projection layer for gameplay semantics:
-        // component-level classification is primary, but heuristic-only interior voxels are promoted
-        // with a full-component mask so flood/drain logic has a valid interior domain.
-        val heuristicInterior = computeInteriorMaskHeuristic(open, sizeX, sizeY, sizeZ)
-        var h = heuristicInterior.nextSetBit(0)
-        while (h >= 0 && h < volume) {
-            if (!open.get(h)) {
-                h = heuristicInterior.nextSetBit(h + 1)
+        // Keep gameplay flood-domain projection: promote voxels that look locally enclosed under shape conductance.
+        // This is intentionally NOT based on boundary connectivity, so leaky pockets stay simulated under holes.
+        //
+        // The heuristic is later filtered by component size to avoid pulling tiny exterior stair/trapdoor cavities
+        // into the simulation domain.
+        val enclosedHeuristic = computeEnclosedHeuristicFromGeometry(
+            open = open,
+            sizeX = sizeX,
+            sizeY = sizeY,
+            sizeZ = sizeZ,
+            faceCondXP = faceCondXP,
+            faceCondYP = faceCondYP,
+            faceCondZP = faceCondZP,
+            passCondThreshold = MIN_OPENING_CONDUCTANCE,
+        )
+        val promotedInterior = enclosedHeuristic.clone() as BitSet
+        promotedInterior.andNot(simulationDomain)
+
+        val promotedVisited = BitSet(volume)
+        val promotedQueue = IntArray(volume)
+
+        var startPromoted = promotedInterior.nextSetBit(0)
+        while (startPromoted >= 0 && startPromoted < volume) {
+            if (promotedVisited.get(startPromoted)) {
+                startPromoted = promotedInterior.nextSetBit(startPromoted + 1)
                 continue
             }
-            interior.set(h)
-            if (voxelInteriorComponentMask[h] == 0L) {
-                val template = templatePalette[templateIndexByVoxel[h]]
-                voxelInteriorComponentMask[h] = fullComponentMask(template.componentCount)
+
+            var head = 0
+            var tail = 0
+            var componentSize = 0
+            var hasNonBoundaryCell = false
+            var touchesAnchoredCell = false
+
+            promotedVisited.set(startPromoted)
+            promotedQueue[tail++] = startPromoted
+
+            fun tryEnqueuePromoted(idx: Int) {
+                if (idx < 0 || idx >= volume) return
+                if (!promotedInterior.get(idx) || promotedVisited.get(idx)) return
+                promotedVisited.set(idx)
+                promotedQueue[tail++] = idx
             }
-            h = heuristicInterior.nextSetBit(h + 1)
+
+            while (head < tail) {
+                val cur = promotedQueue[head++]
+                componentSize++
+
+                val cx = cur % sizeX
+                val ct = cur / sizeX
+                val cy = ct % sizeY
+                val cz = ct / sizeY
+
+                if (cx > 0 && cx + 1 < sizeX &&
+                    cy > 0 && cy + 1 < sizeY &&
+                    cz > 0 && cz + 1 < sizeZ
+                ) {
+                    hasNonBoundaryCell = true
+                }
+
+                if (flooded.get(cur) || materialized.get(cur)) {
+                    touchesAnchoredCell = true
+                }
+
+                if (cx > 0) tryEnqueuePromoted(cur - 1)
+                if (cx + 1 < sizeX) tryEnqueuePromoted(cur + 1)
+                if (cy > 0) tryEnqueuePromoted(cur - strideY)
+                if (cy + 1 < sizeY) tryEnqueuePromoted(cur + strideY)
+                if (cz > 0) tryEnqueuePromoted(cur - strideZ)
+                if (cz + 1 < sizeZ) tryEnqueuePromoted(cur + strideZ)
+            }
+
+            val promoteComponent = touchesAnchoredCell ||
+                (hasNonBoundaryCell && componentSize >= MIN_HEURISTIC_PROMOTED_COMPONENT_SIZE)
+
+            if (promoteComponent) {
+                for (i in 0 until tail) {
+                    val cur = promotedQueue[i]
+                    simulationDomain.set(cur)
+                    if (voxelSimulationComponentMask[cur] == 0L) {
+                        val template = templatePalette[templateIndexByVoxel[cur]]
+                        voxelSimulationComponentMask[cur] = fullComponentMask(template.componentCount)
+                    }
+                }
+            }
+
+            startPromoted = promotedInterior.nextSetBit(startPromoted + 1)
         }
+    }
+
+    // Merge previous simulation domain (bounds remap) to prevent one-tick domain collapse when bounds shift.
+    run {
+        val prev = snapshot.prevSimulationDomain
+        if (!prev.isEmpty) {
+            val prevSizeX = snapshot.prevSizeX
+            val prevSizeY = snapshot.prevSizeY
+            val prevSizeZ = snapshot.prevSizeZ
+            val prevVolumeLong = prevSizeX.toLong() * prevSizeY.toLong() * prevSizeZ.toLong()
+            if (prevVolumeLong > 0L) {
+                val prevVolume = prevVolumeLong.toInt()
+                var prevIdx = prev.nextSetBit(0)
+                while (prevIdx >= 0 && prevIdx < prevVolume) {
+                    val px = prevIdx % prevSizeX
+                    val pt = prevIdx / prevSizeX
+                    val py = pt % prevSizeY
+                    val pz = pt / prevSizeY
+
+                    val worldX = snapshot.prevMinX + px
+                    val worldY = snapshot.prevMinY + py
+                    val worldZ = snapshot.prevMinZ + pz
+
+                    val lx = worldX - snapshot.minX
+                    val ly = worldY - snapshot.minY
+                    val lz = worldZ - snapshot.minZ
+                    if (lx in 0 until sizeX && ly in 0 until sizeY && lz in 0 until sizeZ) {
+                        // Never remap into the boundary shell; that prevents "outside suppression" bleed.
+                        if (lx > 0 && lx + 1 < sizeX &&
+                            ly > 0 && ly + 1 < sizeY &&
+                            lz > 0 && lz + 1 < sizeZ
+                        ) {
+                            val newIdx = lx + sizeX * (ly + sizeY * lz)
+                            if (open.get(newIdx)) {
+                                simulationDomain.set(newIdx)
+                                if (voxelSimulationComponentMask[newIdx] == 0L) {
+                                    val template = templatePalette[templateIndexByVoxel[newIdx]]
+                                    voxelSimulationComponentMask[newIdx] = fullComponentMask(template.componentCount)
+                                }
+                            }
+                        }
+                    }
+
+                    prevIdx = prev.nextSetBit(prevIdx + 1)
+                }
+            }
+        }
+    }
+    simulationDomain.and(open)
+
+    // Compute "true outside" void space for this geometry: boundary-connected open volume excluding simulationDomain.
+    val outsideVoid = computeOutsideVoidFromGeometry(
+        open = open,
+        simulationDomain = simulationDomain,
+        sizeX = sizeX,
+        sizeY = sizeY,
+        sizeZ = sizeZ,
+        faceCondXP = faceCondXP,
+        faceCondYP = faceCondYP,
+        faceCondZP = faceCondZP,
+        passCondThreshold = MIN_OPENING_CONDUCTANCE,
+    )
+
+    // Outside exterior-connected waterloggable cells should not be treated as materialized flood fluid; otherwise
+    // ocean contact can add fake in-ship mass/weight.
+    openIdx = open.nextSetBit(0)
+    while (openIdx >= 0 && openIdx < volume) {
+        if (materialized.get(openIdx) && !simulationDomain.get(openIdx)) {
+            materialized.clear(openIdx)
+            flooded.clear(openIdx)
+        }
+        openIdx = open.nextSetBit(openIdx + 1)
     }
 
     return GeometryAsyncResult(
         generation = snapshot.generation,
         invalidationStamp = snapshot.invalidationStamp,
+        geometrySignature = snapshot.geometrySignature,
         minX = snapshot.minX,
         minY = snapshot.minY,
         minZ = snapshot.minZ,
@@ -457,9 +756,12 @@ internal fun computeGeometryAsync(snapshot: GeometryAsyncSnapshot): GeometryAsyn
         sizeZ = sizeZ,
         open = open,
         exterior = exterior,
-        interior = interior,
+        strictInterior = strictInterior,
+        simulationDomain = simulationDomain,
+        interior = strictInterior,
         flooded = flooded,
         materializedWater = materialized,
+        outsideVoid = outsideVoid,
         faceCondXP = faceCondXP,
         faceCondYP = faceCondYP,
         faceCondZP = faceCondZP,
@@ -467,6 +769,7 @@ internal fun computeGeometryAsync(snapshot: GeometryAsyncSnapshot): GeometryAsyn
         templateIndexByVoxel = templateIndexByVoxel,
         voxelExteriorComponentMask = voxelExteriorComponentMask,
         voxelInteriorComponentMask = voxelInteriorComponentMask,
+        voxelSimulationComponentMask = voxelSimulationComponentMask,
         componentGraphDegraded = componentGraphDegraded,
         computeNanos = System.nanoTime() - startNanos,
     )

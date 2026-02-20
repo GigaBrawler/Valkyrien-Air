@@ -1,13 +1,23 @@
 package org.valkyrienskies.valkyrienair.feature.ship_water_pockets
 
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap
 import net.minecraft.world.level.material.Fluid
 import java.util.BitSet
 import java.util.concurrent.atomic.AtomicReference
+
+internal data class OpeningFaceCoverageSnapshot(
+    val canonicalFluid: Fluid?,
+    val coverageRatio: Double,
+    val centerSubmerged: Boolean,
+    val faceTopWorldY: Double,
+    val estimatedSurfaceY: Double?,
+)
 
 internal data class WaterSolveSnapshot(
     val generation: Long,
     val geometryRevision: Long,
     val captureTick: Long,
+    val transformKey: Long,
     val minX: Int,
     val minY: Int,
     val minZ: Int,
@@ -17,6 +27,7 @@ internal data class WaterSolveSnapshot(
     val open: BitSet,
     val interior: BitSet,
     val exterior: BitSet,
+    val outsideVoid: BitSet,
     val materializedWater: BitSet,
     val floodFluid: Fluid,
     val faceCondXP: ShortArray,
@@ -30,6 +41,7 @@ internal data class WaterSolveSnapshot(
     val submergedCoverage: DoubleArray,
     val dominantFloodFluid: Fluid?,
     val surfaceYByCell: DoubleArray,
+    val openingFaceSamples: Long2ObjectOpenHashMap<OpeningFaceCoverageSnapshot>,
     val baseWorldY: Double,
     val incX: Double,
     val incY: Double,
@@ -48,6 +60,7 @@ internal data class WaterSolveResult(
     val geometryRevision: Long,
     val captureTick: Long,
     val computedTick: Long,
+    val transformKey: Long,
     val waterReachable: BitSet,
     val unreachableVoid: BitSet,
     val buoyancy: BuoyancyMetrics,
@@ -80,6 +93,7 @@ internal fun computeWaterSolveAsync(snapshot: WaterSolveSnapshot): WaterSolveRes
         geometryRevision = snapshot.geometryRevision,
         captureTick = snapshot.captureTick,
         computedTick = snapshot.captureTick,
+        transformKey = snapshot.transformKey,
         waterReachable = out,
         unreachableVoid = unreachable,
         buoyancy = buoyancy,

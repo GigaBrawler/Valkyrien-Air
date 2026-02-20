@@ -9,6 +9,7 @@ import net.minecraft.world.level.block.state.BlockState
 import net.minecraft.world.level.block.state.properties.BlockStateProperties
 import net.minecraft.world.phys.AABB
 import net.minecraft.world.phys.shapes.VoxelShape
+import net.minecraft.world.phys.shapes.Shapes
 import java.util.BitSet
 import kotlin.math.abs
 import kotlin.math.round
@@ -16,6 +17,7 @@ import kotlin.math.round
 private const val GEOMETRY_FACE_SAMPLES_BASE = 8
 private const val GEOMETRY_FACE_SAMPLES_REFINED = 16
 private const val GEOMETRY_SAMPLE_EPS = 1e-4
+private const val GEOMETRY_BOUNDARY_SNAP_EPS = 1.0 / 256.0
 
 internal const val SHAPE_SUBCELL_RES = 8
 internal const val SHAPE_SUBCELL_COUNT = SHAPE_SUBCELL_RES * SHAPE_SUBCELL_RES * SHAPE_SUBCELL_RES
@@ -269,10 +271,107 @@ private fun isGameplaySealedState(state: BlockState): Boolean {
     val block = state.block
     return when (block) {
         is DoorBlock -> !state.getValue(BlockStateProperties.OPEN)
-        is TrapDoorBlock -> !state.getValue(BlockStateProperties.OPEN)
         is FenceGateBlock -> !state.getValue(BlockStateProperties.OPEN)
         else -> false
     }
+}
+
+private fun shapeBlockingScore(shape: VoxelShape): Double {
+    if (shape.isEmpty()) return Double.NEGATIVE_INFINITY
+    var score = 0.0
+    for (box in shape.toAabbs()) {
+        val dx = (box.maxX - box.minX).coerceIn(0.0, 1.0)
+        val dy = (box.maxY - box.minY).coerceIn(0.0, 1.0)
+        val dz = (box.maxZ - box.minZ).coerceIn(0.0, 1.0)
+        score += dx * dy * dz
+    }
+    return score
+}
+
+private fun resolveFluidOcclusionShape(level: Level, pos: BlockPos, state: BlockState): VoxelShape {
+    val collision = state.getCollisionShape(level, pos)
+    val occlusion = state.getOcclusionShape(level, pos)
+    val union =
+        when {
+            collision.isEmpty() && occlusion.isEmpty() -> Shapes.empty()
+            collision.isEmpty() -> occlusion
+            occlusion.isEmpty() -> collision
+            else -> Shapes.or(collision, occlusion)
+        }
+
+    var best = Shapes.empty()
+    var bestScore = Double.NEGATIVE_INFINITY
+    for (candidate in arrayOf(collision, occlusion, union)) {
+        val score = shapeBlockingScore(candidate)
+        if (score > bestScore + 1.0e-9) {
+            bestScore = score
+            best = candidate
+        }
+    }
+    return best
+}
+
+private fun snapBoundaryCoord(value: Double): Double {
+    val clamped = value.coerceIn(0.0, 1.0)
+    if (clamped <= GEOMETRY_BOUNDARY_SNAP_EPS) return 0.0
+    if (clamped >= 1.0 - GEOMETRY_BOUNDARY_SNAP_EPS) return 1.0
+    return clamped
+}
+
+private fun snapFluidBoundaryBox(box: AABB): AABB {
+    val minX = snapBoundaryCoord(box.minX)
+    val minY = snapBoundaryCoord(box.minY)
+    val minZ = snapBoundaryCoord(box.minZ)
+    val maxX = snapBoundaryCoord(box.maxX)
+    val maxY = snapBoundaryCoord(box.maxY)
+    val maxZ = snapBoundaryCoord(box.maxZ)
+    return AABB(minX, minY, minZ, maxX, maxY, maxZ)
+}
+
+private fun snapFacePlaneCoord(value: Double): Double {
+    val clamped = value.coerceIn(0.0, 1.0)
+    val snapped16 = round(clamped * 16.0) / 16.0
+    return if (abs(clamped - snapped16) <= GEOMETRY_BOUNDARY_SNAP_EPS) snapped16.coerceIn(0.0, 1.0) else clamped
+}
+
+private fun stabilizeOpenTrapdoorFacePlane(box: AABB): AABB {
+    var minX = snapFacePlaneCoord(box.minX)
+    var minY = snapFacePlaneCoord(box.minY)
+    var minZ = snapFacePlaneCoord(box.minZ)
+    var maxX = snapFacePlaneCoord(box.maxX)
+    var maxY = snapFacePlaneCoord(box.maxY)
+    var maxZ = snapFacePlaneCoord(box.maxZ)
+
+    // Keep thin open trapdoor planes glued to their boundary face so connectivity won't flicker from tiny gaps.
+    if (maxX - minX <= GEOMETRY_BOUNDARY_SNAP_EPS) {
+        if (minX <= GEOMETRY_BOUNDARY_SNAP_EPS) {
+            minX = 0.0
+            maxX = maxOf(maxX, GEOMETRY_BOUNDARY_SNAP_EPS)
+        } else if (maxX >= 1.0 - GEOMETRY_BOUNDARY_SNAP_EPS) {
+            maxX = 1.0
+            minX = minOf(minX, 1.0 - GEOMETRY_BOUNDARY_SNAP_EPS)
+        }
+    }
+    if (maxY - minY <= GEOMETRY_BOUNDARY_SNAP_EPS) {
+        if (minY <= GEOMETRY_BOUNDARY_SNAP_EPS) {
+            minY = 0.0
+            maxY = maxOf(maxY, GEOMETRY_BOUNDARY_SNAP_EPS)
+        } else if (maxY >= 1.0 - GEOMETRY_BOUNDARY_SNAP_EPS) {
+            maxY = 1.0
+            minY = minOf(minY, 1.0 - GEOMETRY_BOUNDARY_SNAP_EPS)
+        }
+    }
+    if (maxZ - minZ <= GEOMETRY_BOUNDARY_SNAP_EPS) {
+        if (minZ <= GEOMETRY_BOUNDARY_SNAP_EPS) {
+            minZ = 0.0
+            maxZ = maxOf(maxZ, GEOMETRY_BOUNDARY_SNAP_EPS)
+        } else if (maxZ >= 1.0 - GEOMETRY_BOUNDARY_SNAP_EPS) {
+            maxZ = 1.0
+            minZ = minOf(minZ, 1.0 - GEOMETRY_BOUNDARY_SNAP_EPS)
+        }
+    }
+
+    return AABB(minX, minY, minZ, maxX, maxY, maxZ)
 }
 
 private fun isFullCubeBox(box: AABB): Boolean {
@@ -308,15 +407,22 @@ internal fun computeShapeWaterGeometry(level: Level, pos: BlockPos, state: Block
         )
     }
 
-    var shape = state.getCollisionShape(level, pos)
-    if (shape.isEmpty()) {
-        shape = state.getOcclusionShape(level, pos)
-    }
+    val shape = resolveFluidOcclusionShape(level, pos, state)
     if (shape.isEmpty()) {
         return ShapeWaterGeometry(fullSolid = false, refined = false, boxes = emptyList())
     }
 
-    val boxes = shape.toAabbs()
+    val rawBoxes = shape.toAabbs()
+        .asSequence()
+        .map(::snapFluidBoundaryBox)
+        .filter { it.maxX - it.minX > 1e-9 && it.maxY - it.minY > 1e-9 && it.maxZ - it.minZ > 1e-9 }
+        .toList()
+    val forceRefined = state.block is TrapDoorBlock && state.hasProperty(BlockStateProperties.OPEN) && state.getValue(BlockStateProperties.OPEN)
+    val boxes = if (forceRefined) rawBoxes.map(::stabilizeOpenTrapdoorFacePlane) else rawBoxes
+    if (boxes.isEmpty()) {
+        return ShapeWaterGeometry(fullSolid = false, refined = false, boxes = emptyList())
+    }
+
     val fullSolid = state.isCollisionShapeFullBlock(level, pos) || boxes.any(::isFullCubeBox)
     if (fullSolid) {
         return ShapeWaterGeometry(
@@ -328,7 +434,7 @@ internal fun computeShapeWaterGeometry(level: Level, pos: BlockPos, state: Block
 
     return ShapeWaterGeometry(
         fullSolid = false,
-        refined = requiresRefinedSampling(shape, boxes),
+        refined = forceRefined || requiresRefinedSampling(shape, boxes),
         boxes = boxes,
     )
 }
